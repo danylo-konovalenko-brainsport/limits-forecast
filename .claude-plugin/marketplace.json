@@ -1,0 +1,19 @@
+{
+  "name": "claude-limits-mod",
+  "description": "Claude Code mods for keeping an eye on usage limits and model speed.",
+  "owner": {
+    "name": "Danylo Konovalenko"
+  },
+  "plugins": [
+    {
+      "name": "limits",
+      "source": "./plugins/limits",
+      "description": "Forecasts whether you will hit your 5-hour or weekly usage limit before it resets, learns your usage pattern and suggests what to change."
+    },
+    {
+      "name": "token-speed",
+      "source": "./plugins/token-speed",
+      "description": "Live tokens-per-second analytics for every model response."
+    }
+  ]
+}

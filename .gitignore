@@ -1,0 +1,10 @@
+# Types the Claude Code engine lays beside each mod when it loads it
+plugins/*/.claude-plugin/types/
+
+# Safety net: usage data never belongs in the repo (it lives in ~/.claude/limit-metrics)
+limit-metrics/
+*.jsonl
+
+node_modules/
+.DS_Store
+Thumbs.db

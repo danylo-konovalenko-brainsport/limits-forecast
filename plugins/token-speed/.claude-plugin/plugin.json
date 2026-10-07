@@ -1,0 +1,9 @@
+{
+  "name": "token-speed",
+  "version": "0.1.0",
+  "description": "Live tokens-per-second analytics for every model response: status line, /token-speed pane with history, cache hit rate and session totals.",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Danylo Konovalenko"
+  }
+}

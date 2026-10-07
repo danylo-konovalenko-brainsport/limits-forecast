@@ -1,0 +1,7 @@
+{
+  "name": "limits",
+  "version": "0.1.0",
+  "description": "Forecasts whether you will hit your 5-hour or weekly usage limit before it resets, learns your usage pattern over time and suggests what to change.",
+  "author": { "name": "Danylo Konovalenko" },
+  "types": "./types/index.d.ts"
+}
