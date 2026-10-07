@@ -238,6 +238,15 @@ async function scan($: EngineInterface) {
       }
     }
     await walk(`${base}/projects`, 0)
+    // Claude Code deletes transcripts after 30 days by default. Their usage and
+    // limit hits stay cached until they are older than the look-back, so the
+    // forecast can compare with up to 9 past weeks.
+    for (const [path, old] of Object.entries(cache.files)) {
+      if (next.files[path] || Math.max(...Object.keys(old.buckets).map(Number)) < startedAt - KEEP_MS) continue
+      next.files[path] = old
+      mergeBuckets(buckets, old.buckets)
+      hits.push(...old.hits)
+    }
 
     scanBuckets = buckets
     scanAt = startedAt

@@ -343,7 +343,7 @@ Everything stays in `~/.claude/limit-metrics/` (or `$CLAUDE_CONFIG_DIR/limit-met
 | --- | --- |
 | `log-YYYY-MM-<session>.jsonl` | Readings, turns (tokens, context size, duration, interrupted or not), forecasts and events (warnings shown or hidden, tips, pane opened). One file per session and month. Written every 5 minutes and at session end. |
 | `rollup-YYYY-MM.json` | Each transcript's usage per day: tokens per model, tool calls, active quarter-hours, project, effort level, attribution (skill, plugin, MCP server, subagent type), turn and thinking time, interrupted answers, compactions and limit hits. Claude Code deletes transcripts after `cleanupPeriodDays` (30 by default); the rollups keep your history. |
-| `history-cache.json` | Usage per 15 minutes per transcript, keyed by size and modification time. |
+| `history-cache.json` | Usage per 15 minutes and limit hits per transcript, keyed by size and modification time. Kept for 10 weeks, also after Claude Code deletes the transcript, so the forecast can compare with up to 9 past weeks. |
 
 ### Export (`/limits export` → `export/`)
 

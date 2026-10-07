@@ -165,6 +165,17 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
   expect(summary.warnings.shown).toBeGreaterThan(0)
   expect(summary.warnings.hidden).toBe(1)
 
+  // Claude Code deletes old transcripts; their usage and hits stay in the cache.
+  delete files[BIG]
+  delete files[`${CFG}/projects/p1/s.jsonl`]
+  await clock.advance(5 * 60_000)
+  const kept = files[`${CFG}/limit-metrics/history-cache.json`] ?? ''
+  expect(kept).toContain('/cfg/projects/p1/s.jsonl')
+  expect(kept).toContain('"kind":"five_hour"')
+  const pane = await $.ui.mount({ plugin: 'limits-forecast', surface: 'terminal', component: 'Pane', requestId: 'limits', props: {} } as never)
+  expect((await pane.find({ type: 'Text', text: /× 5-hour/ } as never))?.text).toContain('1× 5-hour')
+  await pane.unmount()
+
   await $.session.end({ reason: 'other', sessionId: 'abcdef12-0000' } as never)
   const log = files[`${CFG}/limit-metrics/log-2026-10-abcdef12.jsonl`] ?? ''
   expect(log).toContain('"k":"r"')
