@@ -155,9 +155,9 @@ Anthropic doesn't publish how usage maps to percent, so the mod estimates it. Ta
 
 - $y_i$ = percent points moved
 - $x_i$ = units used by all local sessions in that stretch
-- $w_i = 2^{-\text{age}_i / 14\,\text{d}}$: exponential recency weighting, half-life 14 days, looking back 28 days
+- $`w_i = 2^{-\text{age}_i / 14\,\text{d}}`$: exponential recency weighting, half-life 14 days, looking back 28 days
 
-The model is $y_i = k\,x_i + \varepsilon_i$ with $\operatorname{Var}(\varepsilon_i) \propto x_i$, since larger stretches are noisier in absolute terms. Weighted least squares through the origin under that model is the **ratio estimator** (Cochran, *Sampling Techniques*, ch. 6):
+The model is $`y_i = k\,x_i + \varepsilon_i`$ with $\mathrm{Var}(\varepsilon_i) \propto x_i$, since larger stretches are noisier in absolute terms. Weighted least squares through the origin under that model is the **ratio estimator** (Cochran, *Sampling Techniques*, ch. 6):
 
 ```math
 \hat k \;=\; \frac{\sum_i w_i\,y_i}{\sum_i w_i\,x_i}
@@ -168,7 +168,7 @@ Its standard error comes from the residuals, with a small-sample correction $n/(
 ```math
 s^2 = \frac{n}{n-1}\cdot\frac{\sum_i w_i\,(y_i-\hat k x_i)^2 / x_i}{\sum_i w_i},
 \qquad
-\operatorname{SE}(\hat k) = \sqrt{\frac{s^2 \sum_i w_i^2\,x_i}{\left(\sum_i w_i x_i\right)^2}}
+\mathrm{SE}(\hat k) = \sqrt{\frac{s^2 \sum_i w_i^2\,x_i}{\left(\sum_i w_i x_i\right)^2}}
 ```
 
 Rules:
@@ -180,7 +180,7 @@ Rules:
 **Change detection.** A new plan, or Anthropic changing the limits, makes the old stretches wrong. Waiting for them to fade out of the 28 days would take weeks. So when the **two latest stretches both miss the fit on the same side**, each by more than
 
 ```math
-\max\!\Big(30\%,\ 3\,\tfrac{\operatorname{SE}(\hat k)}{\hat k},\ \tfrac{2}{y_i}\Big)
+\max\!\Big(30\%,\ 3\,\tfrac{\mathrm{SE}(\hat k)}{\hat k},\ \tfrac{2}{y_i}\Big)
 ```
 
 the mod learns from those two alone. The last term allows for small stretches being coarse, since windows move in whole points. A single odd stretch is treated as noise. The pane says when it re-learned.
@@ -203,7 +203,7 @@ and reports $a/b$:
 The standard error of the ratio comes from the delta method:
 
 ```math
-\operatorname{Var}\!\left(\tfrac{a}{b}\right) \approx \frac{\operatorname{Var}(a)}{b^2} + \frac{a^2\operatorname{Var}(b)}{b^4} - \frac{2a\operatorname{Cov}(a,b)}{b^3}
+\mathrm{Var}\!\left(\tfrac{a}{b}\right) \approx \frac{\mathrm{Var}(a)}{b^2} + \frac{a^2\mathrm{Var}(b)}{b^4} - \frac{2a\mathrm{Cov}(a,b)}{b^3}
 ```
 
 It needs ≥ 6 stretches, and both kinds of usage must vary independently, which the determinant check enforces. Otherwise the split can't be identified and the check stays silent.
@@ -227,7 +227,7 @@ A raw 168-cell hour-of-week table would be mostly empty. Instead the mod uses a 
 
 Let $H$ be the hours to reset, $p$ the percent used now, and $L$ the look-back: 1 h for the 5-hour window, 24 h for the week.
 
-- Usual usage until reset: $U_{\text{usual}} = \int_{\text{now}}^{\text{reset}} \text{expected}(t)\,dt$
+- Usual usage until reset: $`U_{\text{usual}} = \int_{\text{now}}^{\text{reset}} \text{expected}(t)\,dt`$
 - Today's deviation: $\Delta = \dfrac{U_{\text{last }L}}{L} - \dfrac{U^{\text{expected}}_{\text{last }L}}{L}$ (units per hour)
 
 A burst doesn't last until the reset, and a slow morning doesn't either. So the deviation decays exponentially (mean reversion) with time constant $\tau$: 1 h for the 5-hour window, 12 h for the week. Integrated over the time left:
@@ -273,7 +273,7 @@ The scenarios are smoothed into one distribution, a **Gaussian kernel density es
 ```math
 F(x) = \frac1n\sum_j \Phi\!\left(\frac{x - S_j}{\sigma}\right),
 \qquad
-\sigma = \sqrt{h^2 + \big(\operatorname{SE}(\hat k)\,B\big)^2},
+\sigma = \sqrt{h^2 + \big(\mathrm{SE}(\hat k)\,B\big)^2},
 \qquad
 h = 0.9\,\min\!\big(s,\ \tfrac{\text{IQR}}{1.34}\big)\,n^{-1/5}
 ```
@@ -307,11 +307,11 @@ The coefficient of variation of your complete past weeks (up to 8):
 Several settings above are reasonable guesses: how fast a deviation fades ($\tau$), the profile's half-life, the width of the range. Once an hour the mod checks them against your own history with a **rolling-origin backtest** (time-series cross-validation; Hyndman & Athanasopoulos, §5.10):
 
 1. **Replay.** At past moments (every 2 h for the 5-hour window, every 6 h for the week) it forecasts the usage until the current horizon, using only what was known at that moment, and compares with what happened. This is done in usage units, so no past limit readings are needed.
-2. **Point forecast.** It tries $\tau \in \{15\text{ m}, 1, 2, 4\text{ h}\}$ (5-hour) or $\{3, 12, 24, 48\text{ h}\}$ (week), and profile half-lives of $\{7, 14, 28\}$ days. It keeps the pair with the smallest mean absolute error, but **only if it beats the defaults by at least 5%**. A smaller gain over a few weeks is easily noise.
+2. **Point forecast.** It tries $`\tau \in \{15\text{ m}, 1, 2, 4\text{ h}\}`$ (5-hour) or $`\{3, 12, 24, 48\text{ h}\}`$ (week), and profile half-lives of $`\{7, 14, 28\}`$ days. It keeps the pair with the smallest mean absolute error, but **only if it beats the defaults by at least 5%**. A smaller gain over a few weeks is easily noise.
 3. **Bias.** With those settings, forecasts are multiplied by $\sum \text{actual} / \sum \text{forecast}$ (a ratio estimator again), clipped to $[0.67, 1.5]$, and ignored when within 5% of 1.
-4. **Range width.** The deviations of the past stretches are scaled by a factor $c \in \{0.5, \dots, 4\}$ until the replayed 80% ranges held closest to 80% of the outcomes. This is **calibrating the prediction interval** on held-out data, the idea behind conformal prediction. Ties go to the factor nearest 1. Scaling the deviations also scales the kernel bandwidth, so the range and the risk stay one distribution.
+4. **Range width.** The deviations of the past stretches are scaled by a factor $`c \in \{0.5, \dots, 4\}`$ until the replayed 80% ranges held closest to 80% of the outcomes. This is **calibrating the prediction interval** on held-out data, the idea behind conformal prediction. Ties go to the factor nearest 1. Scaling the deviations also scales the kernel bandwidth, so the range and the risk stay one distribution.
 
-Replayed moments a few hours apart share most of their future, so they are not independent. The mod counts them as $\min\big(n,\ \lfloor \text{span} / \text{horizon} \rfloor + 1\big)$ and **uses tuned settings only from 10 independent cases**. Before that it uses the defaults:
+Replayed moments a few hours apart share most of their future, so they are not independent. The mod counts them as $`\min\big(n,\ \lfloor \text{span} / \text{horizon} \rfloor + 1\big)`$ and **uses tuned settings only from 10 independent cases**. Before that it uses the defaults:
 - For the 5-hour window that's after a few days.
 - For the week it takes about 6–7 weeks of history: 3 weeks to compare with, plus the replay span.
 
