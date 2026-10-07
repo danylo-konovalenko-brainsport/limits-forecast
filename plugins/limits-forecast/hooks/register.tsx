@@ -51,6 +51,8 @@ const hiddenKey = atom({ plugin: 'limits-forecast', key: 'hiddenKey' } as const,
 
 const MAX_READ = 4 * 1024 * 1024
 const FLUSH_MS = 5 * 60_000
+/** Whether any surface has drawn the band or the pane; VS Code draws neither, though the engine places the pane. */
+let drawsUi = false
 const KEEP_MS = 10 * 7 * DAY
 /** Readings and forecasts of all sessions are loaded this far back. */
 const LOG_DAYS = 40
@@ -451,7 +453,7 @@ const num = (x: number, d = 1) => x.toFixed(d)
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'limits', description: 'Usage limits: forecast, history and suggestions ("/limits export" writes CSVs)' })
+    await $.command.register({ name: 'limits', description: 'Usage limits: forecast, history and suggestions ("/limits text" prints it, "/limits export" writes CSVs)' })
     await init($)
     // The limits line is drawn in the band above the prompt now.
     $.ui.status(undefined)
@@ -529,8 +531,9 @@ export const register: Register = on => {
 
   on('command.run', { command: 'limits' }, async ($, e) => {
     if (e.args.trim() === 'export') return { text: await exportAll($) }
-    await openPane($)
-    log(await $.clock.now(), { k: 'e', e: 'pane' })
+    const asText = e.args.trim() === 'text' || !drawsUi
+    const opened = asText ? undefined : await openPane($)
+    log(await $.clock.now(), { k: 'e', e: asText ? 'text' : 'pane' })
     const v = await read($, view)
     if (!scanning && (v === null || (await $.clock.now()) - scanAt > 30 * 60_000)) {
       $.clock.after(0, () => {
@@ -539,10 +542,13 @@ export const register: Register = on => {
     } else {
       await recompute($)
     }
-    return { text: 'Usage limits pane opened.' }
+    // Where no pane shows, the same report as text.
+    if (opened?.isPlaced !== false && !asText) return { text: 'Usage limits pane opened.' }
+    return { text: reportText(await read($, view)) }
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    drawsUi = true
     const v = await read($, view)
     if (e.props.hasSurvey || !v || v.forecasts.length === 0) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
@@ -605,35 +611,27 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    drawsUi = true
     const { Box, Text } = $.ui.resolve(e)
     const v = await read($, view)
     if (!v) return <Text dimColor>Collecting data…</Text>
-    const hist = v.history
-    const row = (label: string, value: string, dim = false) => (
+    const row = (r: Row) => (
       <Box flexDirection="row">
         <Box width={14} flexShrink={0}>
-          <Text dimColor>{`  ${label}`}</Text>
+          <Text dimColor>{`  ${r.label}`}</Text>
         </Box>
-        <Text dimColor={dim}>{value}</Text>
+        <Text dimColor={r.dim}>{r.value}</Text>
       </Box>
     )
-
+    const rep = report(v)
     return (
       <Box flexDirection="column">
-        {v.forecasts.length > 0 && (
-          <Box marginBottom={1}>
-            <Text dimColor>
-              {`As of ${v.reportedAt !== undefined ? clockTime(v.reportedAt, false) : '–'} · updates with every response`}
-            </Text>
-          </Box>
-        )}
-        {v.forecasts.length === 0 && (
-          <Text dimColor>No limit reading yet: it arrives with the next response (subscription plans only).</Text>
-        )}
+        <Box marginBottom={1}>
+          <Text dimColor>{rep.note}</Text>
+        </Box>
         {v.forecasts.map(f => {
           const c = verdictColor(f.verdict)
           const tint = barTint(f.verdict)
-          const week = f.kind === 'seven_day'
           return (
             <Box flexDirection="column" marginBottom={1}>
               <Box flexDirection="row">
@@ -650,36 +648,13 @@ export const register: Register = on => {
                   <Text {...tint[part.kind]}>{part.text}</Text>
                 ))}
               </Box>
-              {row('used', `${fmtPct(f.p)} now`)}
-              {row(
-                'resets',
-                f.msToReset !== undefined ? `in ${dur(f.msToReset)} · ${clockTime(v.updatedAt + f.msToReset, week)}` : '–',
-                f.msToReset === undefined,
-              )}
-              {row(
-                'at reset',
-                f.projected === undefined
-                  ? '– learning how your tokens map to percent'
-                  : `~${fmtPct(f.projected)}` +
-                      (f.lo !== undefined && f.hi !== undefined
-                        ? `  ·  80% range ${fmtRange(f.lo, f.hi)}  (from ${f.samples} past ${f.sampleUnit})`
-                        : `  ·  range needs 3 comparable past ${week ? 'weeks' : 'days'}`),
-                f.projected === undefined,
-              )}
-              {row('risk', f.risk !== undefined ? `${pct1(f.risk)} chance to run out before the reset` : '– comes with the range', f.risk === undefined)}
-              {row('speed', f.rate !== undefined ? `${f.rate.toFixed(1)}%/h over ${f.rateBasis}` : `– ${f.rateBasis}`, f.rate === undefined)}
-              {row(
-                'even pace',
-                f.pace !== undefined ? `${fmtPct(f.pace)} by now · you are ${f.p <= f.pace ? 'under' : 'over'} by ${Math.round(Math.abs(f.p - f.pace))}` : '–',
-                f.pace === undefined,
-              )}
-              {week && row('per day', f.perDayLeft !== undefined ? `~${fmtPct(f.perDayLeft)} a day left until the reset` : '–', f.perDayLeft === undefined)}
+              {forecastRows(f, v).map(row)}
             </Box>
           )
         })}
         {v.forecasts.length > 0 && (
           <Box marginBottom={1}>
-            <Text dimColor>{'█ used   ▓ forecast by the reset   ▒ 80% range above it   │ the limit (100%)'}</Text>
+            <Text dimColor>{LEGEND}</Text>
           </Box>
         )}
 
@@ -688,60 +663,128 @@ export const register: Register = on => {
           {v.tips.length === 0 ? <Text dimColor>  – nothing to change right now</Text> : v.tips.map(tip => <Text>{`  • ${tip.text}`}</Text>)}
         </Box>
 
-        <Box flexDirection="column" marginBottom={1}>
-          <Text bold>Learning</Text>
-          {v.learned.calib.map(c =>
-            row(
-              c.label,
-              (c.k === undefined
-                ? `learning tokens → %: ${String(Math.round(Math.min(c.points, 3) * 10) / 10)} of 3 points seen`
-                : c.seAssumed
-                  ? `tokens → % learned, ±${pct1((c.se ?? 0) / c.k)} assumed until 3 stretches (${c.n} so far)`
-                  : `tokens → % learned, ±${pct1((c.se ?? 0) / c.k)} (${c.n} stretches)`) +
-                (c.changedAt !== undefined ? ` · re-learned after a change on ${clockTime(c.changedAt, true)}` : ''),
-              c.k === undefined,
-            ),
-          )}
-          {row('Opus cost', opusText(v.learned.opusCheck), !v.learned.opusCheck)}
-          {v.learned.tuning.map(t => row(`${t.label} fit`, tuningText(t), t.independent < MIN_REPLAY))}
-          {row(
-            'your weeks',
-            v.learned.regularity
-              ? `vary by ±${pct1(v.learned.regularity.cv)} from week to week (${v.learned.regularity.weeks} weeks)`
-              : '– needs 2 full weeks',
-            !v.learned.regularity,
-          )}
-        </Box>
-
-        <Box flexDirection="column" marginBottom={1}>
-          <Text bold>Forecast quality · last 4 weeks</Text>
-          {v.quality.map(q => row(q.label, qualityText(q), q.n < 3))}
-        </Box>
-
-        <Box flexDirection="column" marginBottom={1}>
-          <Text bold>History</Text>
-          {row(
-            'read',
-            hist.scanning
-              ? 'reading past sessions…'
-              : `${hist.days} days from ${hist.files} transcripts${hist.skipped ? ` (${hist.skipped} could not be read)` : ''}`,
-          )}
-          {row(
-            'limit hits',
-            hist.hits.count ? hitText(hist.hits) : '– none in your history',
-            !hist.hits.count,
-          )}
-          {row('busiest', hist.busiest.length ? hist.busiest.join(', ') : '– needs a week', !hist.busiest.length)}
-          {row(
-            'past weeks',
-            hist.pastWeeks.length ? `${hist.pastWeeks.map(p => fmtPct(p)).join(' · ')}  (latest first, estimated)` : '–',
-            !hist.pastWeeks.length,
-          )}
-        </Box>
-        <Text dimColor>{`Data: ${v.folder}  ·  /limits export writes CSVs for a retrospective`}</Text>
+        {rep.sections.map(sec => (
+          <Box flexDirection="column" marginBottom={1}>
+            <Text bold>{sec.title}</Text>
+            {sec.rows.map(row)}
+          </Box>
+        ))}
+        <Text dimColor>{rep.footer}</Text>
       </Box>
     )
   })
+}
+
+type Row = { label: string; value: string; dim?: boolean }
+
+const LEGEND = '█ used   ▓ forecast by the reset   ▒ 80% range above it   │ the limit (100%)'
+
+/** One limit's rows, as the pane and the text report show them. */
+function forecastRows(f: View['forecasts'][number], v: View): Row[] {
+  const week = f.kind === 'seven_day'
+  const rows: Row[] = [
+    { label: 'used', value: `${fmtPct(f.p)} now` },
+    {
+      label: 'resets',
+      value: f.msToReset !== undefined ? `in ${dur(f.msToReset)} · ${clockTime(v.updatedAt + f.msToReset, week)}` : '–',
+      dim: f.msToReset === undefined,
+    },
+    {
+      label: 'at reset',
+      value:
+        f.projected === undefined
+          ? '– learning how your tokens map to percent'
+          : `~${fmtPct(f.projected)}` +
+            (f.lo !== undefined && f.hi !== undefined
+              ? `  ·  80% range ${fmtRange(f.lo, f.hi)}  (from ${f.samples} past ${f.sampleUnit})`
+              : `  ·  range needs 3 comparable past ${week ? 'weeks' : 'days'}`),
+      dim: f.projected === undefined,
+    },
+    { label: 'risk', value: f.risk !== undefined ? `${pct1(f.risk)} chance to run out before the reset` : '– comes with the range', dim: f.risk === undefined },
+    { label: 'speed', value: f.rate !== undefined ? `${f.rate.toFixed(1)}%/h over ${f.rateBasis}` : `– ${f.rateBasis}`, dim: f.rate === undefined },
+    {
+      label: 'even pace',
+      value: f.pace !== undefined ? `${fmtPct(f.pace)} by now · you are ${f.p <= f.pace ? 'under' : 'over'} by ${Math.round(Math.abs(f.p - f.pace))}` : '–',
+      dim: f.pace === undefined,
+    },
+  ]
+  if (week) rows.push({ label: 'per day', value: f.perDayLeft !== undefined ? `~${fmtPct(f.perDayLeft)} a day left until the reset` : '–', dim: f.perDayLeft === undefined })
+  return rows
+}
+
+/** The pane's text below the limits: the same for the pane and for `/limits` where no pane shows. */
+function report(v: View) {
+  const hist = v.history
+  const c = (x: View['learned']['calib'][number]): Row => ({
+    label: x.label,
+    value:
+      (x.k === undefined
+        ? `learning tokens → %: ${String(Math.round(Math.min(x.points, 3) * 10) / 10)} of 3 points seen`
+        : x.seAssumed
+          ? `tokens → % learned, ±${pct1((x.se ?? 0) / x.k)} assumed until 3 stretches (${x.n} so far)`
+          : `tokens → % learned, ±${pct1((x.se ?? 0) / x.k)} (${x.n} stretches)`) +
+      (x.changedAt !== undefined ? ` · re-learned after a change on ${clockTime(x.changedAt, true)}` : ''),
+    dim: x.k === undefined,
+  })
+  return {
+    note:
+      v.forecasts.length > 0
+        ? `As of ${v.reportedAt !== undefined ? clockTime(v.reportedAt, false) : '–'} · updates with every response`
+        : 'No limit reading yet: it arrives with the next response (subscription plans only).',
+    sections: [
+      {
+        title: 'Learning',
+        rows: [
+          ...v.learned.calib.map(c),
+          { label: 'Opus cost', value: opusText(v.learned.opusCheck), dim: !v.learned.opusCheck },
+          ...v.learned.tuning.map(t => ({ label: `${t.label} fit`, value: tuningText(t), dim: t.independent < MIN_REPLAY })),
+          {
+            label: 'your weeks',
+            value: v.learned.regularity
+              ? `vary by ±${pct1(v.learned.regularity.cv)} from week to week (${v.learned.regularity.weeks} weeks)`
+              : '– needs 2 full weeks',
+            dim: !v.learned.regularity,
+          },
+        ],
+      },
+      { title: 'Forecast quality · last 4 weeks', rows: v.quality.map(q => ({ label: q.label, value: qualityText(q), dim: q.n < 3 })) },
+      {
+        title: 'History',
+        rows: [
+          {
+            label: 'read',
+            value: hist.scanning
+              ? 'reading past sessions…'
+              : `${hist.days} days from ${hist.files} transcripts${hist.skipped ? ` (${hist.skipped} could not be read)` : ''}`,
+          },
+          { label: 'limit hits', value: hist.hits.count ? hitText(hist.hits) : '– none in your history', dim: !hist.hits.count },
+          { label: 'busiest', value: hist.busiest.length ? hist.busiest.join(', ') : '– needs a week', dim: !hist.busiest.length },
+          {
+            label: 'past weeks',
+            value: hist.pastWeeks.length ? `${hist.pastWeeks.map(p => fmtPct(p)).join(' · ')}  (latest first, estimated)` : '–',
+            dim: !hist.pastWeeks.length,
+          },
+        ],
+      },
+    ] as { title: string; rows: Row[] }[],
+    footer: `Data: ${v.folder}  ·  /limits export writes CSVs for a retrospective`,
+  }
+}
+
+/** The pane as plain text, for surfaces that draw no plugin panes (VS Code). */
+function reportText(v: View | null): string {
+  if (!v) return 'Usage limits: collecting data…'
+  const rep = report(v)
+  const line = (r: Row) => `  ${r.label.padEnd(12)}${r.value}`
+  const out = [rep.note, '']
+  for (const f of v.forecasts) {
+    out.push(`${f.label.padEnd(14)}${VERDICT_TEXT[f.verdict]}`, ' '.repeat(14) + rangeBar(f).map(p => p.text).join(''), ...forecastRows(f, v).map(line), '')
+  }
+  if (v.forecasts.length) out.push(LEGEND, '')
+  out.push('Suggestions', ...(v.tips.length ? v.tips.map(t => `  • ${t.text}`) : ['  – nothing to change right now']), '')
+  for (const sec of rep.sections) out.push(sec.title, ...sec.rows.map(line), '')
+  out.push(rep.footer)
+  return out.join('\n')
 }
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']

@@ -53,6 +53,8 @@ When a window is under pressure, the warning headline, the top suggestions and t
 - **Forecast quality:** the [scores](#how-it-scores-itself) in plain words.
 - **History:** transcripts read, your past limit hits and hours blocked, your busiest days, and your past weeks in percent.
 
+The VS Code extension draws no plugin panes or bands, so there `/limits` prints the same report as text. It goes by whether anything of the mod has been drawn yet. `/limits text` asks for the text version anywhere.
+
 ### `/limits export`
 
 This writes 13 CSV tables and a `summary.json` for retrospectives. The files are listed under [Your data](#your-data).

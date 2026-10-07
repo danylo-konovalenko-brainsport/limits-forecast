@@ -155,6 +155,12 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
   expect(await band.find({ type: 'Text', text: /^HOLD ON$/ } as never)).toBeTruthy()
   await band.unmount()
 
+  // As text, for surfaces without panes: the same rows.
+  const report = (await $.command.run({ command: 'limits', args: 'text' } as never)).text ?? ''
+  expect(report).toContain('95% now')
+  expect(report).toContain('1× 5-hour · 1.0 h blocked')
+  expect(report).toContain('Suggestions')
+
   // The export writes the tables and the summary.
   const exported = await $.command.run({ command: 'limits', args: 'export' } as never)
   expect(exported.text).toContain(`${CFG}/limit-metrics/export`)
