@@ -49,7 +49,7 @@ When a window is under pressure, the warning headline, the top suggestions and t
 
 - **The bar** runs from 0 to 125% in 5% cells. `█` is used, `▓` runs up to the forecast at the reset, `▒` from there to the top of the 80% range, and `│` marks the limit at 100%. It's a fan chart in one row: it draws the side of the range that decides whether you hit the limit, and the numbers next to it give the whole range.
 - **Suggestions** (see [below](#suggestions)).
-- **Learning:** how many tokens make one percent, its standard error, the Opus weight check and how regular your weeks are. Each row says what data it is still waiting for.
+- **Learning:** how many tokens make one percent and its standard error (or the assumed one, and whether it re-learned after a change), the Opus weight check and whether it's applied, what the replay tuned per window, and how regular your weeks are. Each row says what data it is still waiting for.
 - **Forecast quality:** the [scores](#how-it-scores-itself) in plain words.
 - **History:** transcripts read, your past limit hits and hours blocked, your busiest days, and your past weeks in percent.
 
@@ -128,6 +128,7 @@ flowchart LR
 5. **Profile** learns when you usually work: weekday totals times an hour-of-day shape.
 6. **Forecast** combines your usual pattern, today's deviation from it and the spread of your past weeks.
 7. **Self-scoring** compares every logged forecast with the final percent once its window resets.
+8. **Self-tuning** replays past weeks to learn the settings the forecast uses: how fast bursts fade, how much recent weeks count, any bias, and how wide the range must be to hold 80%.
 
 ---
 
@@ -170,10 +171,19 @@ s^2 = \frac{n}{n-1}\cdot\frac{\sum_i w_i\,(y_i-\hat k x_i)^2 / x_i}{\sum_i w_i},
 
 Rules:
 
-- $\hat k$ is used once the stretches add up to ≥ 3 percent points. The SE needs ≥ 3 stretches.
+- $\hat k$ is used once the stretches add up to ≥ 3 percent points.
+- The SE needs ≥ 3 stretches. Until then an SE of 25% of $\hat k$ is **assumed**, so that the range doesn't treat a conversion learned from a single limit hit as exact. The pane marks it as assumed.
 - Stretches with points moved but no local usage are dropped. That usage came from claude.ai or another machine.
 
-The pane shows the result as "1 % ≈ X units ± SE". *(`calibrate`, `ratioFit`)*
+**Change detection.** A new plan, or Anthropic changing the limits, makes the old stretches wrong. Waiting for them to fade out of the 28 days would take weeks. So when the **two latest stretches both miss the fit on the same side**, each by more than
+
+```math
+\max\!\Big(30\%,\ 3\,\tfrac{\operatorname{SE}(\hat k)}{\hat k},\ \tfrac{2}{y_i}\Big)
+```
+
+the mod learns from those two alone. The last term allows for small stretches being coarse, since windows move in whole points. A single odd stretch is treated as noise. The pane says when it re-learned.
+
+*(`calibrate`, `ratioFit`)*
 
 ### 3. Opus weight check (two-variable WLS + delta method)
 
@@ -194,7 +204,9 @@ The standard error of the ratio comes from the delta method:
 \operatorname{Var}\!\left(\tfrac{a}{b}\right) \approx \frac{\operatorname{Var}(a)}{b^2} + \frac{a^2\operatorname{Var}(b)}{b^4} - \frac{2a\operatorname{Cov}(a,b)}{b^3}
 ```
 
-It needs ≥ 6 stretches, and both kinds of usage must vary independently, which the determinant check enforces. Otherwise the split can't be identified and the check stays silent. *(`weightCheck`, `ratioOfTwo`)*
+It needs ≥ 6 stretches, and both kinds of usage must vary independently, which the determinant check enforces. Otherwise the split can't be identified and the check stays silent.
+
+Once the ratio is **clearly** different from 1, Opus usage is counted with it everywhere: the conversion, the profile and the forecast. "Clearly" means more than 2 standard errors away from 1, and measured to within 25%. *(`weightCheck`, `ratioOfTwo`, `opusWeight`, `reweightOpus`)*
 
 ### 4. Weekly profile (multiplicative weekday × hour model)
 
@@ -287,6 +299,21 @@ The coefficient of variation of your complete past weeks (up to 8):
 ```
 
 "Your weeks vary ±48%" means CV = 0.48. *(`regularity`, `cv`)*
+
+### 9. Self-tuning by replaying the past
+
+Several settings above are reasonable guesses: how fast a deviation fades ($\tau$), the profile's half-life, the width of the range. Once an hour the mod checks them against your own history with a **rolling-origin backtest** (time-series cross-validation; Hyndman & Athanasopoulos, §5.10):
+
+1. **Replay.** At past moments (every 2 h for the 5-hour window, every 6 h for the week) it forecasts the usage until the current horizon, using only what was known at that moment, and compares with what happened. This is done in usage units, so no past limit readings are needed.
+2. **Point forecast.** It tries $\tau \in \{15\text{ m}, 1, 2, 4\text{ h}\}$ (5-hour) or $\{3, 12, 24, 48\text{ h}\}$ (week), and profile half-lives of $\{7, 14, 28\}$ days. It keeps the pair with the smallest mean absolute error, but **only if it beats the defaults by at least 5%**. A smaller gain over a few weeks is easily noise.
+3. **Bias.** With those settings, forecasts are multiplied by $\sum \text{actual} / \sum \text{forecast}$ (a ratio estimator again), clipped to $[0.67, 1.5]$, and ignored when within 5% of 1.
+4. **Range width.** The deviations of the past stretches are scaled by a factor $c \in \{0.5, \dots, 4\}$ until the replayed 80% ranges held closest to 80% of the outcomes. This is **calibrating the prediction interval** on held-out data, the idea behind conformal prediction. Ties go to the factor nearest 1. Scaling the deviations also scales the kernel bandwidth, so the range and the risk stay one distribution.
+
+Replayed moments a few hours apart share most of their future, so they are not independent. The mod counts them as $\min\big(n,\ \lfloor \text{span} / \text{horizon} \rfloor + 1\big)$ and **uses tuned settings only from 10 independent cases**. Before that it uses the defaults:
+- For the 5-hour window that's after a few days.
+- For the week it takes about 6–7 weeks of history: 3 weeks to compare with, plus the replay span.
+
+The pane's "fit" rows show what was learned, for example "range ×2.5 so it held 80% instead of 59%". *(`tune`, `expectedBase`, `scenarios`)*
 
 ### Verdicts
 

@@ -42,6 +42,10 @@ export type Calib = {
   n: number
   /** Percent points those stretches moved. */
   points: number
+  /** `se` is an assumed ±25%, not yet measured (fewer than 3 stretches). */
+  seAssumed?: boolean
+  /** Re-learned from recent stretches only after a change from this time on. */
+  changedAt?: number
 }
 
 /** One logged forecast, to be scored once its window has reset. */
@@ -104,6 +108,8 @@ export const VERDICT_TEXT: Record<Verdict, string> = { ok: 'OK', slow: 'SLOW DOW
 
 /** Calibration counts as usable once this many percent points were matched. */
 export const MIN_CALIB_POINTS = 3
+/** Relative error of k assumed until 3 stretches give a measured one. */
+export const ASSUMED_REL_SE = 0.25
 /** Evidence older than this halves in weight. */
 const HALF_LIFE = 14 * DAY
 /** Calibration and scoring look back this far. */
@@ -368,7 +374,7 @@ export function stretches(readings: Reading[], kind: string): [Reading, Reading]
   return out
 }
 
-const decay = (age: number) => Math.pow(0.5, Math.max(0, age) / HALF_LIFE)
+const decay = (age: number, halfLife = HALF_LIFE) => Math.pow(0.5, Math.max(0, age) / halfLife)
 
 /**
  * Learns percent per unit for one window: each stretch's points moved against
@@ -377,16 +383,40 @@ const decay = (age: number) => Math.pow(0.5, Math.max(0, age) / HALF_LIFE)
  * elsewhere (claude.ai, another machine) and are left out.
  */
 export function calibrate(readings: Reading[], between: Between, kind: string, now: number): Calib {
-  const pairs = stretches(readings, kind)
+  let pairs = stretches(readings, kind)
     .filter(([, b]) => now - b.t <= LOOKBACK_DAYS * DAY)
-    .map(([a, b]) => ({ y: b.p - a.p, x: between(a.t, b.t)[0], w: decay(now - b.t) }))
+    .map(([a, b]) => ({ t: a.t, y: b.p - a.p, x: between(a.t, b.t)[0], w: decay(now - b.t) }))
     .filter(p => p.x > 0)
+    .sort((a, b) => a.t - b.t)
+  let fit = ratioFit(pairs)
+  let changedAt: number | undefined
+  // A change (a new plan, new limits): the two latest stretches both far off
+  // the fit on the same side. Learn from them alone instead of waiting weeks
+  // for the old ones to fade. Small stretches are coarse (whole points), so
+  // they need a bigger miss.
+  if (fit && pairs.length >= 4) {
+    const k = fit.k
+    const last = pairs.slice(-2)
+    const off = last.map(p => p.y / (k * p.x) - 1)
+    const tol = last.map(p => Math.max(0.3, (3 * (fit?.se ?? 0)) / k, 2 / p.y))
+    if (off.every((o, i) => o > tol[i]!) || off.every((o, i) => o < -tol[i]!)) {
+      pairs = last
+      fit = ratioFit(pairs)
+      changedAt = last[0]!.t
+    }
+  }
   const points = pairs.reduce((a, p) => a + p.y, 0)
-  const fit = ratioFit(pairs)
   const c: Calib = { kind, n: pairs.length, points }
+  if (changedAt !== undefined) c.changedAt = changedAt
   if (fit && points >= MIN_CALIB_POINTS) {
     c.k = fit.k
+    // Until 3 stretches give a measured error, assume one rather than none:
+    // a range that treats k as exact is overconfident.
     if (fit.se !== undefined) c.se = fit.se
+    else {
+      c.se = fit.k * ASSUMED_REL_SE
+      c.seAssumed = true
+    }
   }
   return c
 }
@@ -405,6 +435,21 @@ export function weightCheck(readings: Reading[], between: Between, now: number) 
     })
   const r = ratioOfTwo(rows)
   return r && { ...r, n: rows.length }
+}
+
+/**
+ * The checked Opus weight once it clearly differs from the assumed one (more
+ * than 2 standard errors away from 1, and measured to within 25%); else 1.
+ */
+export function opusWeight(check?: { ratio: number; se: number }): number {
+  if (!check || check.se > 0.25 * check.ratio || Math.abs(check.ratio - 1) <= 2 * check.se) return 1
+  return check.ratio
+}
+
+/** Buckets with Opus usage counted `r` times as heavy. */
+export function reweightOpus(b: Buckets, r: number): Buckets {
+  if (r === 1) return b
+  return Object.fromEntries(Object.entries(b).map(([k, [u, s, o]]) => [k, [u + (r - 1) * o, s, o * r]]))
 }
 
 const localDayStart = (t: number) => {
@@ -428,7 +473,7 @@ const isWeekend = (t: number) => {
   return day === 0 || day === 6
 }
 
-export type Profile = { perHour: number[]; days: number; since: number }
+export type Profile = { perHour: number[]; days: number; since: number; halfLife: number }
 
 /**
  * Expected units per hour of the week. Factorized: a recency-weighted mean
@@ -436,9 +481,9 @@ export type Profile = { perHour: number[]; days: number; since: number }
  * hours), 7 + 24 numbers instead of 168 sparse ones. Complete days only, idle
  * days included.
  */
-export function profile(b: Buckets, now: number, weeks = 8): Profile {
+export function profile(b: Buckets, now: number, weeks = 8, halfLife = HALF_LIFE): Profile {
   const since = firstBucket(b)
-  const empty = { perHour: new Array(168).fill(0), days: 0, since: now }
+  const empty = { perHour: new Array(168).fill(0), days: 0, since: now, halfLife }
   if (!Number.isFinite(since)) return empty
   const today = localDayStart(now)
   let day = localDayStart(Math.max(since, now - weeks * 7 * DAY))
@@ -451,7 +496,7 @@ export function profile(b: Buckets, now: number, weeks = 8): Profile {
     if (t < day || t >= today) continue
     const d = localDayStart(t)
     totals.set(d, (totals.get(d) ?? 0) + v[0])
-    hours[new Date(t).getHours()] += v[0] * decay(now - t)
+    hours[new Date(t).getHours()] += v[0] * decay(now - t, halfLife)
   }
 
   const sumW = new Array(7).fill(0)
@@ -459,7 +504,7 @@ export function profile(b: Buckets, now: number, weeks = 8): Profile {
   let allW = 0
   let allWT = 0
   for (const [d, total] of totals) {
-    const w = decay(now - d)
+    const w = decay(now - d, halfLife)
     const dow = new Date(d).getDay()
     sumW[dow] += w
     sumWT[dow] += w * total
@@ -474,7 +519,7 @@ export function profile(b: Buckets, now: number, weeks = 8): Profile {
   const shape = smooth.map(x => (total > 0 ? x / total : 1 / 24))
 
   const perHour = new Array(168).fill(0).map((_, i) => (dayMean[Math.floor(i / 24)] ?? 0) * (shape[i % 24] ?? 0))
-  return { perHour, days: (now - since) / DAY, since }
+  return { perHour, days: (now - since) / DAY, since, halfLife }
 }
 
 /** Expected units from `from` to `to` following the profile. */
@@ -529,6 +574,140 @@ export type ForecastInput = {
   between: Between
   readings: Reading[]
   prof?: Profile
+  tune?: Tuning
+}
+
+/**
+ * Expected usage (units) from `now` to `end`: the usual pattern, plus the
+ * recent deviation from it fading out over `tau` (mean reversion), since a
+ * burst does not last until the reset. The deviation is measured over the
+ * last hour (5-hour window) or day (week).
+ */
+export function expectedBase(prof: Profile, between: Between, kind: string, now: number, end: number, tau = TAU[kind] ?? HOUR): number {
+  const lookback = kind === 'seven_day' ? DAY : HOUR
+  const lbH = lookback / HOUR
+  const tauH = tau / HOUR
+  const usual = expectedUnits(prof.perHour, now, end)
+  const current = between(now - lookback, now)[0] / lbH
+  const usualThen = expectedUnits(prof.perHour, now - lookback, now) / lbH
+  return Math.max(0, usual + (current - usualThen) * tauH * (1 - Math.exp(-(end - now) / HOUR / tauH)))
+}
+
+/** One outcome (units) per past stretch: the forecast plus that stretch's deviation from normal, scaled. */
+export function scenarios(base: number, past: number[], scale = 1): number[] {
+  const m = mean(past)
+  return past.map(u => Math.max(0, base + scale * (u - m)))
+}
+
+/** Forecast settings, tuned by replaying past weeks. */
+export type Tuning = {
+  /** How long a deviation from the usual pattern lasts. */
+  tau: number
+  /** Recency half-life of the weekly profile. */
+  halfLife: number
+  /** Width of the range relative to the past spread. */
+  scale: number
+  /** Forecasts are multiplied by this: replayed actual ÷ forecast. */
+  bias: number
+  /** Replayed forecasts. */
+  n: number
+  /** Of those, about how many do not overlap: the time they span ÷ the horizon. */
+  independent: number
+  /** How much smaller the point error got than with the defaults: 0.12 = 12%. */
+  gain?: number
+  /** Share of replayed outcomes inside the 80% range, with the default width and with the tuned one. */
+  coverage0?: number
+  coverage?: number
+}
+
+export const defaultTuning = (kind: string): Tuning => ({ tau: TAU[kind] ?? HOUR, halfLife: HALF_LIFE, scale: 1, bias: 1, n: 0, independent: 0 })
+
+/**
+ * Non-overlapping replayed forecasts needed before tuned settings are used.
+ * Replayed moments a few hours apart share most of their future, so they
+ * count as one.
+ */
+export const MIN_REPLAY = 10
+
+/**
+ * Learns the forecast settings by replaying the past: at many past moments,
+ * forecasts the usage until `horizon` later from what was known then (rolling
+ * origin), and compares with what happened. In usage units, so no past limit
+ * readings are needed. Picks the fade-out time and profile half-life with the
+ * smallest error, then the bias, then the range width that held 80% of
+ * outcomes. A setting only replaces its default when it is clearly better.
+ */
+export function tune(b: Buckets, kind: string, now: number, horizon: number): Tuning {
+  const t0 = defaultTuning(kind)
+  const between = usageIndex(b)
+  const since = firstBucket(b)
+  if (!Number.isFinite(since) || !(horizon > 0)) return t0
+  const isWeek = kind === 'seven_day'
+  const step = isWeek ? 6 * HOUR : 2 * HOUR
+  const taus = (isWeek ? [3, 12, 24, 48] : [0.25, 1, 2, 4]).map(h => h * HOUR)
+  const lives = [7, 14, 28].map(d => d * DAY)
+
+  const cases: { o: number; actual: number; past: number[]; base: number[][] }[] = []
+  const start = Math.max(since + (isWeek ? 21 : 3) * DAY, now - (isWeek ? 63 : LOOKBACK_DAYS) * DAY)
+  for (let o = Math.ceil(start / step) * step; o + horizon <= now; o += step) {
+    const end = o + horizon
+    const past = pastStretches(between, kind, o, end, since)
+    if (past.length < 3) continue
+    const actual = between(o, end)[0]
+    const base = lives.map(hl => {
+      const prof = profile(b, o, 8, hl)
+      return taus.map(tau => expectedBase(prof, between, kind, o, end, tau))
+    })
+    // Idle and expected idle: says nothing about the settings.
+    if (actual === 0 && base.every(row => row.every(x => x === 0))) continue
+    cases.push({ o, actual, past, base })
+  }
+  const n = cases.length
+  const independent = n && Math.min(n, Math.floor((cases[n - 1]!.o - cases[0]!.o) / horizon) + 1)
+  if (independent < MIN_REPLAY) return { ...t0, n, independent }
+
+  const mae = (li: number, ti: number) => mean(cases.map(c => Math.abs(c.base[li]![ti]! - c.actual)))
+  const def: [number, number] = [lives.indexOf(HALF_LIFE), taus.indexOf(t0.tau)]
+  const defErr = mae(...def)
+  let best = def
+  let bestErr = defErr
+  for (let li = 0; li < lives.length; li++) {
+    for (let ti = 0; ti < taus.length; ti++) {
+      const e = mae(li, ti)
+      if (e < bestErr) [best, bestErr] = [[li, ti], e]
+    }
+  }
+  // ponytail: a fixed 5% margin stands in for a significance test (Diebold-Mariano);
+  // replayed moments overlap, so a small gain over a few weeks is easily noise.
+  if (bestErr > 0.95 * defErr) [best, bestErr] = [def, defErr]
+  const [li, ti] = best
+
+  const sumF = cases.reduce((a, c) => a + c.base[li]![ti]!, 0)
+  const ratio = sumF > 0 ? clamp(cases.reduce((a, c) => a + c.actual, 0) / sumF, 0.67, 1.5) : 1
+  const bias = Math.abs(ratio - 1) < 0.05 ? 1 : ratio
+
+  const cover = (scale: number) =>
+    mean(cases.map(c => {
+      const s = scenarios(c.base[li]![ti]! * bias, c.past, scale)
+      return c.actual >= kdeQuantile(s, 0.1) && c.actual <= kdeQuantile(s, 0.9) ? 1 : 0
+    }))
+  // Nearest to 1 first, so a tie keeps the width closer to the past spread.
+  const scales = [1, 1.25, 0.75, 1.5, 2, 0.5, 2.5, 3, 4]
+  const covs = scales.map(cover)
+  let si = 0
+  for (let i = 1; i < scales.length; i++) if (Math.abs(covs[i]! - 0.8) < Math.abs(covs[si]! - 0.8)) si = i
+
+  return {
+    tau: taus[ti]!,
+    halfLife: lives[li]!,
+    scale: scales[si]!,
+    bias,
+    n,
+    independent,
+    gain: defErr > 0 ? 1 - bestErr / defErr : 0,
+    coverage0: covs[0]!,
+    coverage: covs[si]!,
+  }
 }
 
 export function forecast(x: ForecastInput): Forecast {
@@ -565,14 +744,9 @@ export function forecast(x: ForecastInput): Forecast {
   let risk: number | undefined
   let samples: number | undefined
   if (k !== undefined && x.prof && x.prof.days >= 3 && x.resetsAt !== undefined && hoursToReset !== undefined) {
-    // Usual pattern until reset, plus today's deviation from it fading out
-    // over TAU (mean reversion): a burst does not last until the reset.
-    const lbH = lookback / HOUR
-    const tauH = (TAU[x.kind] ?? HOUR) / HOUR
-    const usual = expectedUnits(x.prof.perHour, x.now, x.resetsAt)
-    const now = x.between(x.now - lookback, x.now)[0] / lbH
-    const then = expectedUnits(x.prof.perHour, x.now - lookback, x.now) / lbH
-    const base = Math.max(0, usual + (now - then) * tauH * (1 - Math.exp(-hoursToReset / tauH)))
+    // Settings the replay of past weeks tuned (or the defaults).
+    const t = x.tune ?? defaultTuning(x.kind)
+    const base = expectedBase(x.prof, x.between, x.kind, x.now, x.resetsAt, t.tau) * t.bias
     projected = x.p + k * base
 
     // Spread: how the same stretch varied in the past, one scenario per past
@@ -580,8 +754,7 @@ export function forecast(x: ForecastInput): Forecast {
     // The 80% range and the risk both come from that one distribution.
     const past = pastStretches(x.between, x.kind, x.now, x.resetsAt, x.prof.since)
     if (past.length >= 3) {
-      const m = mean(past)
-      const sims = past.map(u => x.p + k * Math.max(0, base + u - m))
+      const sims = scenarios(base, past, t.scale).map(u => x.p + k * u)
       const kSd = (x.cal?.se ?? 0) * base
       lo = Math.max(x.p, kdeQuantile(sims, 0.1, kSd))
       hi = kdeQuantile(sims, 0.9, kSd)

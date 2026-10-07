@@ -31,6 +31,25 @@ export type CalibView = {
   se?: number
   n: number
   points: number
+  /** `se` is an assumed ±25% until 3 stretches give a measured one. */
+  seAssumed?: boolean
+  /** Re-learned from recent stretches only, after a change from this time on. */
+  changedAt?: number
+}
+
+/** Forecast settings learned by replaying past weeks. */
+export type TuningView = {
+  kind: string
+  label: string
+  tau: number
+  halfLife: number
+  scale: number
+  bias: number
+  n: number
+  independent: number
+  gain?: number
+  coverage0?: number
+  coverage?: number
 }
 
 export type QualityView = {
@@ -59,7 +78,9 @@ export type View = {
   learned: {
     calib: CalibView[]
     /** Observed Opus cost relative to the assumed weight (1 = as assumed). */
-    opusCheck?: { ratio: number; se: number; n: number }
+    opusCheck?: { ratio: number; se: number; n: number; applied: boolean }
+    /** Forecast settings learned by replaying past weeks, per window. */
+    tuning: TuningView[]
     /** Week-to-week variation of usage (coefficient of variation). */
     regularity?: { cv: number; weeks: number }
   }

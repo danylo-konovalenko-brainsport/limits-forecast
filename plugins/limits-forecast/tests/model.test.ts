@@ -2,9 +2,9 @@ import { expect, test } from 'claude-code/testing'
 
 import {
   addToBuckets, calibrate, DAY, evaluate, forecast, hitReadings, HOUR, mergeHits, parseTranscript, profile, rangeBar, statusParts, statusText, suggestions, dur, units,
-  usageIndex, weightCheck,
+  usageIndex, weightCheck, ASSUMED_REL_SE, defaultTuning, MIN_REPLAY, opusWeight, reweightOpus, tune,
 } from '../hooks/model'
-import type { Buckets, Forecast, ForecastLog, Reading, Turn } from '../hooks/model'
+import type { Buckets, Forecast, ForecastLog, Tuning, Reading, Turn } from '../hooks/model'
 import { kdeQuantile, kdeTail, normCdf, quantile, ratioFit } from '../hooks/stats'
 
 const NOW = Date.parse('2026-10-07T12:00:00Z')
@@ -74,6 +74,29 @@ test('past limit hits alone teach tokens → %: 0% at the window start, 100% whe
   const c = calibrate(readings, usageIndex(b), 'five_hour', NOW)
   expect(c.n).toBe(3)
   close(c.k, 100 / 73.3)
+  // One hit alone: learned, with an assumed ±25% until there are 3.
+  const one = calibrate(readings.slice(0, 2), usageIndex(b), 'five_hour', NOW)
+  expect(one.seAssumed).toBe(true)
+  close(one.se! / one.k!, ASSUMED_REL_SE)
+})
+
+test('a change in the limits is noticed from the two latest stretches', async () => {
+  const { b, readings } = history(0.5, () => 5)
+  // Today the same usage moves the window twice as far.
+  const start = NOW - 6 * HOUR
+  const r = new Date(start + 5 * HOUR).toISOString()
+  readings.push({ t: start, kind: 'five_hour', p: 0, r })
+  for (let h = 0; h < 2; h++) {
+    addToBuckets(b, turnU(start + h * HOUR + 30 * 60_000, 5))
+    readings.push({ t: start + (h + 1) * HOUR, kind: 'five_hour', p: (h + 1) * 5, r })
+  }
+  const c = calibrate(readings, usageIndex(b), 'five_hour', NOW)
+  close(c.k, 1)
+  expect(c.changedAt).toBe(start)
+  // One odd stretch is noise, not a change.
+  const noise = calibrate(readings.slice(0, -1), usageIndex(b), 'five_hour', NOW)
+  expect(noise.changedAt).toBe(undefined)
+  expect(noise.k!).toBeLessThan(0.6)
 })
 
 test('weights tokens like API list prices', async () => {
@@ -145,6 +168,15 @@ test('calibration learns percent per unit from all usage between readings', asyn
   const c2 = calibrate(few.readings.slice(0, 3), usageIndex(few.b), 'five_hour', NOW)
   close(c2.points, 1.6)
   expect(c2.k).toBe(undefined)
+})
+
+test('a clear Opus weight is applied, an unclear one is not', async () => {
+  expect(opusWeight({ ratio: 1.3, se: 0.05 })).toBe(1.3)
+  // Within 2 standard errors of 1, or too imprecise: keep the assumed weight.
+  expect(opusWeight({ ratio: 1.08, se: 0.05 })).toBe(1)
+  expect(opusWeight({ ratio: 1.6, se: 0.5 })).toBe(1)
+  expect(opusWeight(undefined)).toBe(1)
+  expect(reweightOpus({ '0': [10, 0, 4] }, 1.5)).toEqual({ '0': [12, 0, 6] })
 })
 
 test('the Opus weight check finds Opus costing more than assumed', async () => {
@@ -242,6 +274,23 @@ test('the risk is the share of past weeks that would run out', async () => {
   expect(Math.abs(unsure.risk! - 0.5)).toBeLessThan(Math.abs(f.risk! - 0.5))
   // A pattern forecast alone never says "hold on".
   expect(f.verdict === 'hold').toBe(false)
+})
+
+test('replaying the past tunes the forecast, once there is enough of it', async () => {
+  const b = workdays(w => (w % 2 ? 4 : 30))
+  // Weekly: 5 weeks of history give too few non-overlapping replays.
+  const wk = tune(b, 'seven_day', NOW, 2 * DAY)
+  expect(wk.independent).toBeLessThan(MIN_REPLAY)
+  expect(wk).toMatchObject({ scale: 1, bias: 1, tau: defaultTuning('seven_day').tau })
+  // 5-hour: plenty of past days, and the tuned range holds closer to 80%.
+  const t = tune(b, 'five_hour', NOW, 3 * HOUR)
+  expect(t.independent).toBeGreaterThanOrEqual(MIN_REPLAY)
+  expect(Math.abs(t.coverage! - 0.8)).toBeLessThanOrEqual(Math.abs(t.coverage0! - 0.8))
+  // Tuned settings reach the forecast: a wider range, a bias.
+  const f = (tn?: Tuning) => forecast({ kind: 'seven_day', p: 50, resetsAt: NOW + 3.5 * DAY, now: NOW, cal: { k: 1 }, between: usageIndex(b), readings: [], prof: profile(b, NOW), tune: tn })
+  const width = (x: Forecast) => x.hi! - x.lo!
+  expect(width(f({ ...defaultTuning('seven_day'), scale: 2 }))).toBeGreaterThan(width(f()))
+  expect(f({ ...defaultTuning('seven_day'), bias: 0.5 }).projected!).toBeLessThan(f().projected!)
 })
 
 test('forecasts are scored once their window has reset', async () => {

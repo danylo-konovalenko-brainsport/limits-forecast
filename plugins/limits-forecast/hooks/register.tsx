@@ -35,9 +35,13 @@ import {
   usageIndex,
   VERDICT_TEXT,
   weightCheck,
+  opusWeight,
+  reweightOpus,
+  tune,
+  MIN_REPLAY,
   worst,
 } from './model'
-import type { BarPart, Buckets, Calib, Forecast, ForecastLog, Hit, Reading, Turn, Verdict } from './model'
+import type { BarPart, Buckets, Calib, Forecast, ForecastLog, Hit, Reading, Tuning, Turn, Verdict } from './model'
 import { blockedMs, buildExport, byMonth, emptyLog, forecastEntry, limitHits, logName, parseLog, projectOf, rollupTranscript } from './retro'
 import type { DayRow, Log, Rollup } from './retro'
 
@@ -269,6 +273,17 @@ function allBuckets(): Buckets {
   return b
 }
 
+/** Tuned settings per window: the replay is costly, so it runs at most once an hour. */
+const tuned = new Map<string, { key: string; t: Tuning }>()
+function tuningFor(kind: string, b: Buckets, now: number, horizon: number, opus: number): Tuning {
+  const key = `${Math.floor(now / HOUR)}|${Math.round(horizon / HOUR)}|${opus}`
+  const cur = tuned.get(kind)
+  if (cur?.key === key) return cur.t
+  const t = tune(b, kind, now, horizon)
+  tuned.set(kind, { key, t })
+  return t
+}
+
 async function recompute($: EngineInterface) {
   const now = await $.clock.now()
   reportedAt ??= own.readings.reduce<number | undefined>((a, r) => Math.max(a ?? 0, r.t), undefined)
@@ -276,28 +291,37 @@ async function recompute($: EngineInterface) {
   const allLimits = usage?.rateLimits ?? []
   const limits = allLimits.filter(l => KINDS.includes(l.kind))
   context = usage?.context.tokens ?? context
-  const buckets = allBuckets()
-  const between = usageIndex(buckets)
-  const prof = profile(buckets, now)
+  const raw = allBuckets()
   const logs = allLogs(now)
   // Past limit hits are exact readings too: 0% at the window's start, 100% when refused.
   const readings = dedupeReadings([...logs.readings, ...hitReadings(scanHits)])
   const logged = logs.forecasts
+  // Once the check shows Opus clearly costs more (or less) than assumed, count it so.
+  const check = weightCheck(readings, usageIndex(raw), now)
+  const opus = opusWeight(check)
+  const buckets = reweightOpus(raw, opus)
+  const between = usageIndex(buckets)
+  const prof = profile(buckets, now)
   const cal: Record<string, Calib> = Object.fromEntries(KINDS.map(kind => [kind, calibrate(readings, between, kind, now)]))
 
-  const forecasts: Forecast[] = limits.map(l =>
-    forecast({
+  const tunings: Record<string, Tuning> = {}
+  const forecasts: Forecast[] = limits.map(l => {
+    const resetsAt = l.resetsAt ? Date.parse(l.resetsAt) : undefined
+    const t = tuningFor(l.kind, buckets, now, resetsAt === undefined ? 0 : resetsAt - now, opus)
+    tunings[l.kind] = t
+    return forecast({
       kind: l.kind,
       p: l.percentUsed,
-      resetsAt: l.resetsAt ? Date.parse(l.resetsAt) : undefined,
+      resetsAt,
       r: l.resetsAt ? normReset(l.resetsAt) : undefined,
       now,
       cal: cal[l.kind],
       between,
       readings,
-      prof,
-    }),
-  )
+      prof: t.halfLife === prof.halfLife ? prof : profile(buckets, now, 8, t.halfLife),
+      tune: t,
+    })
+  })
 
   // One forecast per window and hour is kept, to be scored after the reset.
   for (const [i, f] of forecasts.entries()) {
@@ -330,7 +354,6 @@ async function recompute($: EngineInterface) {
 
   const week = limits.find(l => l.kind === 'seven_day')
   const kWeek = cal.seven_day?.k
-  const check = weightCheck(readings, between, now)
   const reg = regularity(between, now, prof.since)
   const next: View = {
     updatedAt: now,
@@ -341,7 +364,8 @@ async function recompute($: EngineInterface) {
     tips,
     learned: {
       calib: KINDS.map(kind => ({ label: LABEL[kind] ?? kind, ...cal[kind]!, kind })),
-      ...(check ? { opusCheck: check } : {}),
+      ...(check ? { opusCheck: { ...check, applied: opus !== 1 } } : {}),
+      tuning: KINDS.filter(kind => tunings[kind]).map(kind => ({ kind, label: LABEL[kind] ?? kind, ...tunings[kind]! })),
       ...(reg ? { regularity: reg } : {}),
     },
     quality: KINDS.map(kind => ({ label: LABEL[kind] ?? kind, ...evaluate(logged, readings, kind, now) })),
@@ -669,15 +693,17 @@ export const register: Register = on => {
           {v.learned.calib.map(c =>
             row(
               c.label,
-              c.k === undefined
+              (c.k === undefined
                 ? `learning tokens → %: ${String(Math.round(Math.min(c.points, 3) * 10) / 10)} of 3 points seen`
-                : c.se !== undefined
-                  ? `tokens → % learned, ±${pct1(c.se / c.k)} (${c.n} stretches)`
-                  : `tokens → % learned (${c.n} stretches; error estimate from 3)`,
+                : c.seAssumed
+                  ? `tokens → % learned, ±${pct1((c.se ?? 0) / c.k)} assumed until 3 stretches (${c.n} so far)`
+                  : `tokens → % learned, ±${pct1((c.se ?? 0) / c.k)} (${c.n} stretches)`) +
+                (c.changedAt !== undefined ? ` · re-learned after a change on ${clockTime(c.changedAt, true)}` : ''),
               c.k === undefined,
             ),
           )}
           {row('Opus cost', opusText(v.learned.opusCheck), !v.learned.opusCheck)}
+          {v.learned.tuning.map(t => row(`${t.label} fit`, tuningText(t), t.independent < MIN_REPLAY))}
           {row(
             'your weeks',
             v.learned.regularity
@@ -729,7 +755,23 @@ function opusText(c: View['learned']['opusCheck']): string {
   if (!c) return '– needs more mixed Opus and other use to check'
   const x = `×${num(c.ratio, 2)} ± ${num(c.se, 2)}`
   if (Math.abs(c.ratio - 1) <= 2 * c.se) return `weighted as assumed (${x})`
-  return `${c.ratio > 1 ? 'costs more' : 'costs less'} of your limit than assumed (${x})`
+  return `${c.ratio > 1 ? 'costs more' : 'costs less'} of your limit than assumed (${x})${c.applied ? ', now counted so' : ', not yet precise enough to apply'}`
+}
+
+/** What the replay of past weeks learned, in plain words. */
+function tuningText(t: View['learned']['tuning'][number]): string {
+  if (t.independent < MIN_REPLAY) return `– tunes itself from ${MIN_REPLAY} non-overlapping replayed forecasts (${t.independent} so far)`
+  const parts = [`bursts fade over ${dur(t.tau)}`, `recent ${Math.round(t.halfLife / DAY)} days count half`]
+  if (t.gain !== undefined && t.gain > 0) parts.push(`${pct1(t.gain)} more accurate than the defaults`)
+  if (t.bias !== 1) parts.push(`forecasts ×${num(t.bias, 2)} (they ran ${t.bias < 1 ? 'high' : 'low'})`)
+  if (t.coverage !== undefined) {
+    parts.push(
+      t.scale === 1
+        ? `range held ${pct1(t.coverage)} (aim 80%)`
+        : `range ×${num(t.scale, 2)} so it held ${pct1(t.coverage)} instead of ${pct1(t.coverage0 ?? 0)} (aim 80%)`,
+    )
+  }
+  return `${parts.join(' · ')}  (${t.n} replayed, ~${t.independent} independent)`
 }
 
 function qualityText(q: View['quality'][number]): string {
