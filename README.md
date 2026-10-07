@@ -70,7 +70,7 @@ You get a toast when the verdict gets worse, and when a window crosses 80% and 9
 At the prompt of a Claude Code session:
 
 ```
-/plugin install limits-forecast --marketplace <owner>/limits-forecast
+/plugin install limits-forecast --marketplace danylo-konovalenko-brainsport/limits-forecast
 ```
 
 Or from a local clone:
