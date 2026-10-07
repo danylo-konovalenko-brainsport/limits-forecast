@@ -9,7 +9,7 @@ A Claude Code mod that forecasts your 5‑hour and weekly usage limits, learns y
 
 ## What you get
 
-### Status line
+### Limits line above the prompt
 
 ```
 Limits as of 14:02  5h 42% ↻ 2h30 → 68% (61–77) risk 0% · OK  │  wk 61% ↻ 3d → 104% (88–119) risk 75% · SLOW DOWN
@@ -26,11 +26,9 @@ Limits as of 14:02  5h 42% ↻ 2h30 → 68% (61–77) risk 0% · OK  │  wk 61%
 | `risk 0%` | **Probability** of reaching 100% before the reset. |
 | `OK` / `SLOW DOWN` / `HOLD ON` | The verdict (rules [below](#verdicts)). |
 
-The fields are the same whatever the verdict. A `–` means *not known yet*, for example before the mod has learned enough.
+The fields are the same whatever the verdict. A `–` means *not known yet*, for example before the mod has learned enough. The percentages are bold and the verdict is colored: OK green, SLOW DOWN yellow, HOLD ON red.
 
-### Warning band above the prompt
-
-This band shows up only when a window is under pressure. It has the headline and the top suggestions. **Hide** keeps it away until the situation changes; **Details** opens the pane.
+When a window is under pressure, the warning headline, the top suggestions and two buttons appear under the line: **Hide** keeps the warning away until the situation changes (the line stays); **Details** opens the pane.
 
 ### `/limits` pane
 
@@ -113,7 +111,7 @@ flowchart LR
     C --> F[Forecast<br/>+ 80% interval + risk]
     P --> F
     U --> F
-    F --> V[Verdict · status line · pane · tips]
+    F --> V[Verdict · limits line · pane · tips]
     F -->|logged hourly| S[Self-scoring<br/>after reset]
     R --> S
 ```
@@ -389,9 +387,9 @@ claude plugin test plugins/limits
 plugins/limits/
 ├── hooks/
 │   ├── stats.ts       # mean, type-7 quantile, CV, OLS slope, ratio estimator, 2-variable WLS
-│   ├── model.ts       # units, buckets, transcript parser, calibration, profile, forecast, scoring, status line
+│   ├── model.ts       # units, buckets, transcript parser, calibration, profile, forecast, scoring, limits line text
 │   ├── retro.ts       # logs, daily rollups, limit hits, CSV/JSON export
-│   └── register.tsx   # wiring: Claude Code events, status line, band, pane, /limits command
+│   └── register.tsx   # wiring: Claude Code events, limits line and warning above the prompt, pane, /limits command
 ├── tests/             # model, retro, register and end-to-end flow tests
 └── types/index.d.ts   # the mod's state contract
 ```

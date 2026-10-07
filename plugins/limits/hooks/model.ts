@@ -790,14 +790,20 @@ export function dur(ms: number): string {
 export function statusText(forecasts: Forecast[], at?: number): string | undefined {
   if (forecasts.length === 0) return undefined
   const parts = forecasts.map(f => {
-    const reset = f.msToReset === undefined ? '–' : dur(f.msToReset)
-    const ahead = f.projected === undefined
-      ? '→ –'
-      : `→ ${fmtPct(f.projected)}${f.lo !== undefined && f.hi !== undefined ? ` (${Math.round(f.lo)}–${Math.round(f.hi)})` : ''}`
-    const risk = f.risk === undefined ? 'risk –' : `risk ${fmtPct(f.risk * 100)}`
-    return `${SHORT[f.kind] ?? f.kind} ${fmtPct(f.p)} ↻ ${reset} ${ahead} ${risk} · ${VERDICT_TEXT[f.verdict]}`
+    const s = statusParts(f)
+    return `${s.name} ${s.pct} ${s.rest} · ${s.verdict}`
   })
   return `Limits${at === undefined ? '' : ` as of ${hhmm(at)}`}  ` + parts.join('  │  ')
+}
+
+/** One window's status fields, apart so they can be drawn in their own colors. */
+export function statusParts(f: Forecast) {
+  const reset = f.msToReset === undefined ? '–' : dur(f.msToReset)
+  const ahead = f.projected === undefined
+    ? '→ –'
+    : `→ ${fmtPct(f.projected)}${f.lo !== undefined && f.hi !== undefined ? ` (${Math.round(f.lo)}–${Math.round(f.hi)})` : ''}`
+  const risk = f.risk === undefined ? 'risk –' : `risk ${fmtPct(f.risk * 100)}`
+  return { name: SHORT[f.kind] ?? f.kind, pct: fmtPct(f.p), rest: `↻ ${reset} ${ahead} ${risk}`, verdict: VERDICT_TEXT[f.verdict] }
 }
 
 /** Local clock time, `14:02`. */

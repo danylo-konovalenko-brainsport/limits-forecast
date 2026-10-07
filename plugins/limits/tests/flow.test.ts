@@ -100,20 +100,25 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
   // The transcript's days are kept in the monthly rollup, which outlives it.
   expect(files[`${CFG}/limit-metrics/rollup-2026-10.json`] ?? '').toContain('"project":"p1"')
 
-  const last = statuses.filter(Boolean).pop() ?? ''
-  expect(last).toMatch(/^Limits as of \d\d:\d\d  5h 92%/)
-  expect(last).toContain('wk 30%')
+  // The limits line is drawn in the band, not the plain status line.
+  expect(statuses.filter(Boolean)).toEqual([])
+  const lineBand = await $.ui.mount({ plugin: 'limits', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 20 } } as never)
+  const text = async (re: RegExp) => (await lineBand.find({ type: 'Text', text: re } as never))?.text
+  expect(await text(/^Limits as of \d\d:\d\d/)).toBeTruthy()
+  expect(await text(/^92%$/)).toBe('92%')
+  expect(await text(/^30%$/)).toBe('30%')
   // The refused request in the large transcript taught tokens → %: the 5-hour
   // window has a forecast, and at the test's speed it runs out within the hour.
-  expect(last).toMatch(/5h 92% ↻ 3h00 → \d+%/)
-  expect(last).toContain('HOLD ON')
+  expect(await text(/↻ 3h00 → \d+%/)).toBeTruthy()
+  expect(await text(/^HOLD ON$/)).toBe('HOLD ON')
 
   // A response that does not move a window still refreshes the time.
   await clock.advance(3 * 60_000)
   await $.session.measure({ context: { tokens: 150_000, window: 200_000 }, rateLimits: limits, changed: ['context'] } as never)
   const at = new Date(clock.now())
   const hm = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
-  expect(statuses.filter(Boolean).pop()).toContain(`as of ${hm}`)
+  expect(await text(/^Limits as of/)).toContain(`as of ${hm}`)
+  await lineBand.unmount()
 
   // A turn is logged with its duration; the window moves on.
   await clock.advance(1000)
@@ -142,6 +147,8 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
   expect((await band.find({ type: 'Text', text: /Hold on/ } as never))?.text).toContain('Hold on: 5-hour limit almost used')
   await band.press({ key: 'hide' } as never)
   expect(await band.find({ type: 'Text', text: /Hold on/ } as never)).toBeFalsy()
+  // Hidden, the warning goes; the limits line stays.
+  expect(await band.find({ type: 'Text', text: /^HOLD ON$/ } as never)).toBeTruthy()
   await band.unmount()
 
   // The export writes the tables and the summary.

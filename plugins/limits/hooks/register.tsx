@@ -27,7 +27,8 @@ import {
   profile,
   regularity,
   SHORT,
-  statusText,
+  hhmm,
+  statusParts,
   suggestions,
   toLog,
   usageIndex,
@@ -69,7 +70,6 @@ let scanHits: Hit[] = []
 let context: number | undefined
 /** When Claude Code last reported the limits: they come with responses only. */
 let reportedAt: number | undefined
-let shown: Forecast[] = []
 const lastLive: Record<string, Reading> = {}
 const logLines: Record<string, string[]> = {}
 const dirty = new Set<string>()
@@ -348,8 +348,6 @@ async function recompute($: EngineInterface) {
   }
   await update($, view, () => next)
 
-  shown = forecasts
-  $.ui.status(statusText(forecasts, reportedAt))
 
   // Speak up only when things get worse, or a threshold is crossed.
   if (isWorse(overall, prevOverall) && worstOne) $.ui.toast(worstOne.headline, { timeoutMs: 8000 })
@@ -406,6 +404,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'limits', description: 'Usage limits: forecast, history and suggestions ("/limits export" writes CSVs)' })
     await init($)
+    // The limits line is drawn in the band above the prompt now.
+    $.ui.status(undefined)
     timer?.cancel()
     // Every few minutes: write the log, pick up other sessions' usage, recompute.
     timer = $.clock.every(FLUSH_MS, () => {
@@ -471,9 +471,8 @@ export const register: Register = on => {
       log(now, { k: 'r', w: l.kind, p: l.percentUsed, r })
     }
     if (e.changed.includes('rateLimits')) await recompute($)
-    else if (e.rateLimits.length && shown.length) {
+    else if (e.rateLimits.length) {
       // Same percent, fresh report: only the time moves.
-      $.ui.status(statusText(shown, reportedAt))
       await update($, view, v => (v ? { ...v, reportedAt: now } : v))
     }
     return next(e)
@@ -496,13 +495,31 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const v = await read($, view)
-    if (e.props.hasSurvey || !v || v.overall === 'ok' || (await read($, hiddenKey)) === v.warningKey) {
-      return next(e)
-    }
+    if (e.props.hasSurvey || !v || v.forecasts.length === 0) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
+    // Always one line, each verdict in its own color; the warning only under pressure.
+    const line = (
+      <Box flexDirection="row">
+        <Text dimColor>{`Limits${v.reportedAt !== undefined ? ` as of ${hhmm(v.reportedAt)}` : ''}  `}</Text>
+        {v.forecasts.map((f, i) => {
+          const s = statusParts(f)
+          return (
+            <Box flexDirection="row" flexShrink={0}>
+              {i > 0 && <Text dimColor>{'  │  '}</Text>}
+              <Text dimColor>{`${s.name} `}</Text>
+              <Text bold>{s.pct}</Text>
+              <Text dimColor>{` ${s.rest} · `}</Text>
+              <Text bold color={f.verdict === 'ok' ? 'success' : f.verdict === 'slow' ? 'warning' : 'error'}>{s.verdict}</Text>
+            </Box>
+          )
+        })}
+      </Box>
+    )
+    if (v.overall === 'ok' || (await read($, hiddenKey)) === v.warningKey) return line
     const head = v.forecasts.find(f => f.verdict === v.overall)
     return (
       <Box flexDirection="column">
+        {line}
         <Text bold color={v.overall === 'hold' ? 'error' : 'warning'}>
           {v.overall === 'hold' ? 'Hold on: ' : 'Slow down: '}
           {head?.headline ?? ''}
