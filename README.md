@@ -1,10 +1,8 @@
 # claude-limits-mod
 
-Claude Code mods for keeping an eye on your usage limits.
+A Claude Code mod for keeping an eye on your usage limits.
 
 **limits** watches your 5-hour and weekly limits. It tells you whether you will run out before the reset if you keep your current speed, learns how you usually use Claude, and suggests what to change when you're burning too fast.
-
-**token-speed** shows how fast the model generates (tokens per second, time to first token).
 
 ## Install
 
@@ -14,7 +12,7 @@ At the prompt of a Claude Code terminal session:
 /plugin install limits --marketplace C:\projects\git\claude-limits-mod
 ```
 
-Answer `y` to add the marketplace, then pick a scope (user scope = every session). `token-speed` installs the same way. Once the repo is on GitHub, `--marketplace <owner>/<repo>` works too.
+Answer `y` to add the marketplace, then pick a scope (user scope = every session). Once the repo is on GitHub, `--marketplace <owner>/<repo>` works too.
 
 To try a change without installing: `claude --plugin-dir C:\projects\git\claude-limits-mod\plugins\limits`.
 
