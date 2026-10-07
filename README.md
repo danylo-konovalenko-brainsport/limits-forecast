@@ -1,4 +1,4 @@
-# limits
+# limits-forecast
 
 A Claude Code mod that forecasts your 5‑hour and weekly usage limits, learns your usage pattern and suggests what to change before you run out.
 
@@ -63,13 +63,13 @@ You get a toast when the verdict gets worse, and when a window crosses 80% and 9
 At the prompt of a Claude Code session:
 
 ```
-/plugin install limits --marketplace <owner>/claude-limits-mod
+/plugin install limits-forecast --marketplace <owner>/limits-forecast
 ```
 
 Or from a local clone:
 
 ```
-/plugin install limits --marketplace C:\path\to\claude-limits-mod
+/plugin install limits-forecast --marketplace C:\path\to\limits-forecast
 ```
 
 Answer `y` to add the marketplace, then choose user scope so it runs in every session.
@@ -79,7 +79,7 @@ After changing the code of a local install, run `/reload-plugins`. There's nothi
 To try it without installing:
 
 ```
-claude --plugin-dir ./plugins/limits
+claude --plugin-dir ./plugins/limits-forecast
 ```
 
 > **Requirements:** a Claude Code build with mod support (developed on 2.1.292) and a subscription plan. Only subscription plans report rate-limit windows.
@@ -379,12 +379,12 @@ Everything stays in `~/.claude/limit-metrics/` (or `$CLAUDE_CONFIG_DIR/limit-met
 ## Development
 
 ```
-claude plugin validate plugins/limits
-claude plugin test plugins/limits
+claude plugin validate plugins/limits-forecast
+claude plugin test plugins/limits-forecast
 ```
 
 ```
-plugins/limits/
+plugins/limits-forecast/
 ├── hooks/
 │   ├── stats.ts       # mean, type-7 quantile, CV, OLS slope, ratio estimator, 2-variable WLS
 │   ├── model.ts       # units, buckets, transcript parser, calibration, profile, forecast, scoring, limits line text

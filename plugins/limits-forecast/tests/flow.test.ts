@@ -102,7 +102,7 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
 
   // The limits line is drawn in the band, not the plain status line.
   expect(statuses.filter(Boolean)).toEqual([])
-  const lineBand = await $.ui.mount({ plugin: 'limits', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 20 } } as never)
+  const lineBand = await $.ui.mount({ plugin: 'limits-forecast', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 20 } } as never)
   const text = async (re: RegExp) => (await lineBand.find({ type: 'Text', text: re } as never))?.text
   expect(await text(/^Limits as of \d\d:\d\d/)).toBeTruthy()
   expect(await text(/^92%$/)).toBe('92%')
@@ -135,15 +135,15 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
   } as never)
 
   // The pane and the warning band draw on both surfaces; Hide dismisses the band.
-  const hitsPane = await $.ui.mount({ plugin: 'limits', surface: 'terminal', component: 'Pane', requestId: 'limits', props: {} } as never)
+  const hitsPane = await $.ui.mount({ plugin: 'limits-forecast', surface: 'terminal', component: 'Pane', requestId: 'limits', props: {} } as never)
   expect((await hitsPane.find({ type: 'Text', text: /× 5-hour/ } as never))?.text).toContain('1× 5-hour · 1.0 h blocked')
   await hitsPane.unmount()
   for (const surface of ['terminal', 'desktop'] as const) {
-    const pane = await $.ui.mount({ plugin: 'limits', surface, component: 'Pane', requestId: 'limits', props: {} } as never)
+    const pane = await $.ui.mount({ plugin: 'limits-forecast', surface, component: 'Pane', requestId: 'limits', props: {} } as never)
     expect((await pane.find({ type: 'Text', text: /% now/ } as never))?.text).toBe('95% now')
     await pane.unmount()
   }
-  const band = await $.ui.mount({ plugin: 'limits', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 20 } } as never)
+  const band = await $.ui.mount({ plugin: 'limits-forecast', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 20 } } as never)
   expect((await band.find({ type: 'Text', text: /Hold on/ } as never))?.text).toContain('Hold on: 5-hour limit almost used')
   await band.press({ key: 'hide' } as never)
   expect(await band.find({ type: 'Text', text: /Hold on/ } as never)).toBeFalsy()

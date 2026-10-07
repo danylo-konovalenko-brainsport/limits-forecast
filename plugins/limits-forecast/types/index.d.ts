@@ -80,6 +80,6 @@ export type View = {
 
 declare module 'claude-code' {
   interface PluginState {
-    limits: { view: View | null; hiddenKey: string }
+    'limits-forecast': { view: View | null; hiddenKey: string }
   }
 }

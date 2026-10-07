@@ -41,8 +41,8 @@ import { blockedMs, buildExport, byMonth, emptyLog, forecastEntry, limitHits, lo
 import type { DayRow, Log, Rollup } from './retro'
 
 const PANE = 'limits'
-const view = atom({ plugin: 'limits', key: 'view' } as const, null)
-const hiddenKey = atom({ plugin: 'limits', key: 'hiddenKey' } as const, '')
+const view = atom({ plugin: 'limits-forecast', key: 'view' } as const, null)
+const hiddenKey = atom({ plugin: 'limits-forecast', key: 'hiddenKey' } as const, '')
 
 const MAX_READ = 4 * 1024 * 1024
 const FLUSH_MS = 5 * 60_000

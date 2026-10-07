@@ -1,13 +1,13 @@
 {
-  "name": "claude-limits-mod",
+  "name": "limits-forecast",
   "description": "Claude Code mod that forecasts your usage limits and helps you stay within them.",
   "owner": {
     "name": "Danylo Konovalenko"
   },
   "plugins": [
     {
-      "name": "limits",
-      "source": "./plugins/limits",
+      "name": "limits-forecast",
+      "source": "./plugins/limits-forecast",
       "description": "Forecasts whether you will hit your 5-hour or weekly usage limit before it resets, learns your usage pattern and suggests what to change."
     }
   ]
