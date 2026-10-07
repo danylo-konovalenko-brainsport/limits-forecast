@@ -12,28 +12,33 @@ A Claude Code mod that forecasts your 5‑hour and weekly usage limits, learns y
 ### Limits line above the prompt
 
 ```
-Limits as of 14:02  5h 42% ↻ 2h30 → 68% (61–77) risk 0% · OK  │  wk 61% ↻ 3d → 104% (88–119) risk 75% · SLOW DOWN
+5h ███▓▓▒··│·· 42% ↻ 2h30 → 68% (61–77) risk 0% ● OK   │   wk █████▓▓▓│▒▒ 61% ↻ 3d → 104% (88–119) risk 75% ● SLOW DOWN   · 14:02
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `as of 14:02` | When Claude Code last reported your limits. Claude Code gets them with each response, so they update when you send a message; usage in other sessions or on claude.ai shows up after your next one. |
+| `· 14:02` | When Claude Code last reported your limits. Claude Code gets them with each response, so they update when you send a message; usage in other sessions or on claude.ai shows up after your next one. |
 | `5h` / `wk` | The 5-hour window and the weekly window. |
+| `███▓▓▒··│··` | A small version of the [pane's bar](#limits-pane), 0–125% in 10 cells. Left out when the terminal is too narrow for the line. |
 | `42%` | Used now, exactly as Claude Code reports it. |
-| `↻ 2h30` | Time until the window resets. |
+| `↻ 2h30` | Time until the window resets (`1d 23h` beyond a day). |
 | `→ 68%` | **Point forecast**: the expected percent at reset. |
 | `(61–77)` | **80% prediction interval**: the final value lands in this range about 8 times out of 10. |
 | `risk 0%` | **Probability** of reaching 100% before the reset. |
 | `OK` / `SLOW DOWN` / `HOLD ON` | The verdict (rules [below](#verdicts)). |
 
-The fields are the same whatever the verdict. A `–` means *not known yet*, for example before the mod has learned enough. The percentages are bold and the verdict is colored: OK green, SLOW DOWN yellow, HOLD ON red.
+The fields are the same whatever the verdict. A `–` means *not known yet*, for example before the mod has learned enough. Colors:
+
+- **Verdict:** OK green, SLOW DOWN yellow, HOLD ON red.
+- **Forecast:** green, yellow when it is at 90% or more or its range reaches past 100%, red when it is over 100%. So a tight window stands out even while the verdict is OK.
+- **Bar:** the used part in the verdict color, the rest dim.
 
 When a window is under pressure, the warning headline, the top suggestions and two buttons appear under the line: **Hide** keeps the warning away until the situation changes (the line stays); **Details** opens the pane.
 
 ### `/limits` pane
 
 ```
-5-hour   ████████▓▓▓▓▒▒▒·····│·····
+5-hour   ████████▓▓▓▓▓▓▒·····│·····
   used          42% now
   resets        in 2h30 · 16:32
   at reset      ~68%  ·  80% range 61–77%  (from 12 past days)
@@ -42,7 +47,7 @@ When a window is under pressure, the warning headline, the top suggestions and t
   even pace     50% by now · you are under by 8
 ```
 
-- **The bar** runs from 0 to 125% in 5% cells. `█` is used, `▓` is likely by the reset (up to the lower end of the range), `▒` is the rest of the 80% range, and `│` marks the limit at 100%.
+- **The bar** runs from 0 to 125% in 5% cells. `█` is used, `▓` runs up to the forecast at the reset, `▒` from there to the top of the 80% range, and `│` marks the limit at 100%. It's a fan chart in one row: it draws the side of the range that decides whether you hit the limit, and the numbers next to it give the whole range.
 - **Suggestions** (see [below](#suggestions)).
 - **Learning:** how many tokens make one percent, its standard error, the Opus weight check and how regular your weeks are. Each row says what data it is still waiting for.
 - **Forecast quality:** the [scores](#how-it-scores-itself) in plain words.

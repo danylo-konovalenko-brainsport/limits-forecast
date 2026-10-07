@@ -777,33 +777,44 @@ export function dur(ms: number): string {
   const m = Math.max(0, Math.round(ms / 60_000))
   if (m < 60) return `${m}m`
   const h = Math.floor(m / 60)
-  if (h < 48) return `${h}h${String(m % 60).padStart(2, '0')}`
-  return `${Math.round(h / 24)}d`
+  if (h < 24) return `${h}h${String(m % 60).padStart(2, '0')}`
+  return h % 24 ? `${Math.floor(h / 24)}d ${h % 24}h` : `${h / 24}d`
 }
 
 /**
- * The status line: when Claude Code last reported the limits, then the same
- * fields for every window, OK or not, in the same order. A dash stands for
- * what is not known yet.
- *   Limits as of 14:02  5h 42% ↻ 2h30 → 68% (61–77) risk 0% · OK  │  wk 61% ↻ 3d → 104% (88–119) risk 75% · SLOW DOWN
+ * The limits line as plain text: the same fields for every window, OK or not,
+ * in the same order, then when Claude Code last reported them. A dash stands
+ * for what is not known yet.
+ *   5h 42% ↻ 2h30 → 68% (61–77) risk 0% ● OK   │   wk 61% ↻ 3d → 104% (88–119) risk 75% ● SLOW DOWN   · 14:02
  */
 export function statusText(forecasts: Forecast[], at?: number): string | undefined {
   if (forecasts.length === 0) return undefined
   const parts = forecasts.map(f => {
     const s = statusParts(f)
-    return `${s.name} ${s.pct} ${s.rest} · ${s.verdict}`
+    return `${s.name} ${s.pct} ↻ ${s.reset} → ${s.ahead}${s.range ? ` (${s.range})` : ''} risk ${s.risk} ● ${s.verdict}`
   })
-  return `Limits${at === undefined ? '' : ` as of ${hhmm(at)}`}  ` + parts.join('  │  ')
+  return parts.join('   │   ') + (at === undefined ? '' : `   · ${hhmm(at)}`)
 }
 
-/** One window's status fields, apart so they can be drawn in their own colors. */
+/**
+ * One window's fields, apart so they can be drawn in their own colors. `tone`
+ * colors the forecast: bad over 100%, warn when it is near or its range
+ * reaches past the limit.
+ */
 export function statusParts(f: Forecast) {
-  const reset = f.msToReset === undefined ? '–' : dur(f.msToReset)
-  const ahead = f.projected === undefined
-    ? '→ –'
-    : `→ ${fmtPct(f.projected)}${f.lo !== undefined && f.hi !== undefined ? ` (${Math.round(f.lo)}–${Math.round(f.hi)})` : ''}`
-  const risk = f.risk === undefined ? 'risk –' : `risk ${fmtPct(f.risk * 100)}`
-  return { name: SHORT[f.kind] ?? f.kind, pct: fmtPct(f.p), rest: `↻ ${reset} ${ahead} ${risk}`, verdict: VERDICT_TEXT[f.verdict] }
+  const tone: 'good' | 'warn' | 'bad' | undefined = f.projected === undefined
+    ? undefined
+    : f.projected > 100 ? 'bad' : f.projected >= 90 || (f.hi ?? 0) > 100 ? 'warn' : 'good'
+  return {
+    name: SHORT[f.kind] ?? f.kind,
+    pct: fmtPct(f.p),
+    reset: f.msToReset === undefined ? '–' : dur(f.msToReset),
+    ahead: f.projected === undefined ? '–' : fmtPct(f.projected),
+    range: f.lo !== undefined && f.hi !== undefined ? `${Math.round(f.lo)}–${Math.round(f.hi)}` : undefined,
+    risk: f.risk === undefined ? '–' : fmtPct(f.risk * 100),
+    verdict: VERDICT_TEXT[f.verdict],
+    tone,
+  }
 }
 
 /** Local clock time, `14:02`. */
@@ -815,12 +826,15 @@ export const hhmm = (t: number) => {
 export type BarPart = { kind: 'used' | 'likely' | 'range' | 'free' | 'limit'; text: string }
 
 /**
- * A bar from 0 to 125% in 5% cells with the limit marked at 100%: what is
- * used, what the forecast adds by the reset, the rest of its 80% range.
+ * A bar from 0 to 125% (25 cells of 5% by default) with the limit marked at
+ * 100%: what is used, what the forecast adds by the reset, and the 80% range
+ * above the forecast.
  */
-export function rangeBar(f: Pick<Forecast, 'p' | 'projected' | 'lo' | 'hi'>): BarPart[] {
+export function rangeBar(f: Pick<Forecast, 'p' | 'projected' | 'hi'>, cells = 25): BarPart[] {
   const CH = { used: '█', likely: '▓', range: '▒', free: '·', limit: '│' } as const
-  const likelyTo = f.lo ?? f.projected ?? f.p
+  // ▓ up to the forecast, ▒ from there to the top of the range: the side
+  // that decides whether the limit is reached (a fan chart in one row).
+  const likelyTo = f.projected ?? f.p
   const rangeTo = f.hi ?? f.projected ?? f.p
   const parts: BarPart[] = []
   const push = (kind: BarPart['kind']) => {
@@ -828,9 +842,10 @@ export function rangeBar(f: Pick<Forecast, 'p' | 'projected' | 'lo' | 'hi'>): Ba
     if (last && last.kind === kind) last.text += CH[kind]
     else parts.push({ kind, text: CH[kind] })
   }
-  for (let i = 0; i < 25; i++) {
-    if (i === 20) push('limit')
-    const mid = i * 5 + 2.5
+  const step = 125 / cells
+  for (let i = 0; i < cells; i++) {
+    if (i === Math.round(cells * 0.8)) push('limit')
+    const mid = (i + 0.5) * step
     push(mid < f.p ? 'used' : mid < likelyTo ? 'likely' : mid < rangeTo ? 'range' : 'free')
   }
   return parts

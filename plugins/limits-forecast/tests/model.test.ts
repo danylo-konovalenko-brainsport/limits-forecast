@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
-  addToBuckets, calibrate, DAY, evaluate, forecast, hitReadings, HOUR, mergeHits, parseTranscript, profile, rangeBar, statusText, suggestions, units,
+  addToBuckets, calibrate, DAY, evaluate, forecast, hitReadings, HOUR, mergeHits, parseTranscript, profile, rangeBar, statusParts, statusText, suggestions, dur, units,
   usageIndex, weightCheck,
 } from '../hooks/model'
 import type { Buckets, Forecast, ForecastLog, Reading, Turn } from '../hooks/model'
@@ -281,15 +281,23 @@ test('status line shows the same fields whatever the verdict, a dash for what is
   expect(statusText([
     f('five_hour', 42, { msToReset: 2.5 * HOUR, projected: 68, lo: 61, hi: 77, risk: 0 }),
     f('seven_day', 61, { msToReset: 3 * DAY, projected: 104, lo: 88, hi: 119, risk: 0.75, verdict: 'slow' }),
-  ])).toBe('Limits  5h 42% ↻ 2h30 → 68% (61–77) risk 0% · OK  │  wk 61% ↻ 3d → 104% (88–119) risk 75% · SLOW DOWN')
-  expect(statusText([f('five_hour', 30, { msToReset: 3 * HOUR })])).toBe('Limits  5h 30% ↻ 3h00 → – risk – · OK')
+  ])).toBe('5h 42% ↻ 2h30 → 68% (61–77) risk 0% ● OK   │   wk 61% ↻ 3d → 104% (88–119) risk 75% ● SLOW DOWN')
+  expect(statusText([f('five_hour', 30, { msToReset: 3 * HOUR })])).toBe('5h 30% ↻ 3h00 → – risk – ● OK')
   const at = new Date(2026, 9, 7, 14, 2).getTime()
-  expect(statusText([f('five_hour', 30, { msToReset: 3 * HOUR })], at)).toBe('Limits as of 14:02  5h 30% ↻ 3h00 → – risk – · OK')
+  expect(statusText([f('five_hour', 30, { msToReset: 3 * HOUR })], at)).toBe('5h 30% ↻ 3h00 → – risk – ● OK   · 14:02')
+  expect(dur(47.75 * HOUR)).toBe('1d 23h')
+  expect(dur(4 * HOUR + 5 * 60_000)).toBe('4h05')
+  // The forecast's color: near or past the limit stands out even while OK.
+  expect(statusParts(f('seven_day', 57, { projected: 101, lo: 79, hi: 127 })).tone).toBe('bad')
+  expect(statusParts(f('seven_day', 57, { projected: 85, lo: 70, hi: 104 })).tone).toBe('warn')
+  expect(statusParts(f('five_hour', 9, { projected: 45, lo: 12, hi: 73 })).tone).toBe('good')
 })
 
 test('the bar shows used, likely and the 80% range against the limit', async () => {
   const text = (parts: { kind: string; text: string }[]) => parts.map(p => `${p.kind}:${p.text.length}`).join(' ')
   // 0–125% in 5% cells, the limit mark after cell 20.
-  expect(text(rangeBar({ p: 60, projected: 104, lo: 88, hi: 119 }))).toBe('used:12 likely:6 range:2 limit:1 range:4 free:1')
+  expect(text(rangeBar({ p: 60, projected: 104, hi: 119 }))).toBe('used:12 likely:8 limit:1 likely:1 range:3 free:1')
   expect(text(rangeBar({ p: 30 }))).toBe('used:6 free:14 limit:1 free:5')
+  // The small bar of the limits line: 10 cells of 12.5%.
+  expect(text(rangeBar({ p: 57, projected: 101, hi: 127 }, 10))).toBe('used:5 likely:3 limit:1 range:2')
 })

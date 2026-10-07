@@ -29,6 +29,7 @@ import {
   SHORT,
   hhmm,
   statusParts,
+  statusText,
   suggestions,
   toLog,
   usageIndex,
@@ -395,6 +396,21 @@ async function exportAll($: EngineInterface): Promise<string> {
   return `Exported to ${out}${skipped ? ` (${skipped} files skipped: over 4 MiB or unreadable)` : ''}.`
 }
 
+const verdictColor = (verdict: Verdict) => (verdict === 'ok' ? 'success' : verdict === 'slow' ? 'warning' : 'error')
+const TONE = { good: 'success', warn: 'warning', bad: 'error' } as const
+
+/** How each part of a bar is drawn, in the window's verdict color. */
+const barTint = (verdict: Verdict): Record<BarPart['kind'], { color?: string; dimColor?: boolean; bold?: boolean }> => ({
+  used: { color: verdictColor(verdict) },
+  likely: { color: verdictColor(verdict), dimColor: true },
+  range: { color: 'subtle' },
+  free: { color: 'subtle', dimColor: true },
+  limit: { bold: true },
+})
+
+/** Cells of the small bar in the limits line, left out when the line would not fit. */
+const LINE_BAR = 10
+
 const openPane = ($: EngineInterface) => $.ui.open({ id: PANE, title: 'Usage limits' })
 
 const pct1 = (x: number) => `${Math.round(x * 100)}%`
@@ -498,21 +514,33 @@ export const register: Register = on => {
     if (e.props.hasSurvey || !v || v.forecasts.length === 0) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
     // Always one line, each verdict in its own color; the warning only under pressure.
+    // The small bars go when the line would not fit.
+    const plain = statusText(v.forecasts, v.reportedAt) ?? ''
+    const bars = plain.length + v.forecasts.length * (LINE_BAR + 2) <= e.props.bodyColumns
     const line = (
       <Box flexDirection="row">
-        <Text dimColor>{`Limits${v.reportedAt !== undefined ? ` as of ${hhmm(v.reportedAt)}` : ''}  `}</Text>
         {v.forecasts.map((f, i) => {
           const s = statusParts(f)
           return (
             <Box flexDirection="row" flexShrink={0}>
-              {i > 0 && <Text dimColor>{'  │  '}</Text>}
+              {i > 0 && <Text dimColor>{'   │   '}</Text>}
               <Text dimColor>{`${s.name} `}</Text>
+              {bars && rangeBar(f, LINE_BAR).map(part => <Text {...barTint(f.verdict)[part.kind]}>{part.text}</Text>)}
+              {bars && <Text> </Text>}
               <Text bold>{s.pct}</Text>
-              <Text dimColor>{` ${s.rest} · `}</Text>
-              <Text bold color={f.verdict === 'ok' ? 'success' : f.verdict === 'slow' ? 'warning' : 'error'}>{s.verdict}</Text>
+              <Text dimColor>{' ↻ '}</Text>
+              <Text>{s.reset}</Text>
+              <Text dimColor>{' → '}</Text>
+              <Text bold={s.tone !== undefined && s.tone !== 'good'} {...(s.tone ? { color: TONE[s.tone] } : { dimColor: true })}>{s.ahead}</Text>
+              {s.range && <Text dimColor>{` (${s.range})`}</Text>}
+              <Text dimColor>{' risk '}</Text>
+              <Text dimColor={s.risk === '–'}>{s.risk}</Text>
+              <Text color={verdictColor(f.verdict)}>{' ● '}</Text>
+              <Text bold color={verdictColor(f.verdict)}>{s.verdict}</Text>
             </Box>
           )
         })}
+        {v.reportedAt !== undefined && <Text dimColor>{`   · ${hhmm(v.reportedAt)}`}</Text>}
       </Box>
     )
     if (v.overall === 'ok' || (await read($, hiddenKey)) === v.warningKey) return line
@@ -548,7 +576,6 @@ export const register: Register = on => {
     const v = await read($, view)
     if (!v) return <Text dimColor>Collecting data…</Text>
     const hist = v.history
-    const color = (verdict: Verdict) => (verdict === 'ok' ? 'success' : verdict === 'slow' ? 'warning' : 'error')
     const row = (label: string, value: string, dim = false) => (
       <Box flexDirection="row">
         <Box width={14} flexShrink={0}>
@@ -571,14 +598,8 @@ export const register: Register = on => {
           <Text dimColor>No limit reading yet: it arrives with the next response (subscription plans only).</Text>
         )}
         {v.forecasts.map(f => {
-          const c = color(f.verdict)
-          const tint: Record<BarPart['kind'], { color?: string; dimColor?: boolean; bold?: boolean }> = {
-            used: { color: c },
-            likely: { color: c, dimColor: true },
-            range: { color: 'subtle' },
-            free: { color: 'subtle', dimColor: true },
-            limit: { bold: true },
-          }
+          const c = verdictColor(f.verdict)
+          const tint = barTint(f.verdict)
           const week = f.kind === 'seven_day'
           return (
             <Box flexDirection="column" marginBottom={1}>
@@ -625,7 +646,7 @@ export const register: Register = on => {
         })}
         {v.forecasts.length > 0 && (
           <Box marginBottom={1}>
-            <Text dimColor>{'█ used   ▓ likely by the reset   ▒ 80% range   │ the limit (100%)'}</Text>
+            <Text dimColor>{'█ used   ▓ forecast by the reset   ▒ 80% range above it   │ the limit (100%)'}</Text>
           </Box>
         )}
 
