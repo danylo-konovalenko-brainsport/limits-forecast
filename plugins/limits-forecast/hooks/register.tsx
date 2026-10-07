@@ -453,7 +453,7 @@ const num = (x: number, d = 1) => x.toFixed(d)
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'limits', description: 'Usage limits: forecast, history and suggestions ("/limits text" prints it, "/limits export" writes CSVs)' })
+    await $.command.register({ name: 'limits-forecast', description: 'Usage limits: forecast, history and suggestions ("/limits-forecast text" prints it, "/limits-forecast export" writes CSVs)' })
     await init($)
     // The limits line is drawn in the band above the prompt now.
     $.ui.status(undefined)
@@ -529,7 +529,7 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'limits' }, async ($, e) => {
+  on('command.run', { command: 'limits-forecast' }, async ($, e) => {
     if (e.args.trim() === 'export') return { text: await exportAll($) }
     const asText = e.args.trim() === 'text' || !drawsUi
     const opened = asText ? undefined : await openPane($)
@@ -712,7 +712,7 @@ function forecastRows(f: View['forecasts'][number], v: View): Row[] {
   return rows
 }
 
-/** The pane's text below the limits: the same for the pane and for `/limits` where no pane shows. */
+/** The pane's text below the limits: the same for the pane and for `/limits-forecast` where no pane shows. */
 function report(v: View) {
   const hist = v.history
   const c = (x: View['learned']['calib'][number]): Row => ({
@@ -767,7 +767,7 @@ function report(v: View) {
         ],
       },
     ] as { title: string; rows: Row[] }[],
-    footer: `Data: ${v.folder}  ·  /limits export writes CSVs for a retrospective`,
+    footer: `Data: ${v.folder}  ·  /limits-forecast export writes CSVs for a retrospective`,
   }
 }
 

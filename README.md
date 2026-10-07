@@ -35,7 +35,7 @@ The fields are the same whatever the verdict. A `–` means *not known yet*, for
 
 When a window is under pressure, the warning headline, the top suggestions and two buttons appear under the line: **Hide** keeps the warning away until the situation changes (the line stays); **Details** opens the pane.
 
-### `/limits` pane
+### `/limits-forecast` pane
 
 ```
 5-hour   ████████▓▓▓▓▓▓▒·····│·····
@@ -53,9 +53,9 @@ When a window is under pressure, the warning headline, the top suggestions and t
 - **Forecast quality:** the [scores](#how-it-scores-itself) in plain words.
 - **History:** transcripts read, your past limit hits and hours blocked, your busiest days, and your past weeks in percent.
 
-The VS Code extension draws no plugin panes or bands, so there `/limits` prints the same report as text. It goes by whether anything of the mod has been drawn yet. `/limits text` asks for the text version anywhere.
+The VS Code extension draws no plugin panes or bands, so there `/limits-forecast` prints the same report as text. It goes by whether anything of the mod has been drawn yet. `/limits-forecast text` asks for the text version anywhere.
 
-### `/limits export`
+### `/limits-forecast export`
 
 This writes 13 CSV tables and a `summary.json` for retrospectives. The files are listed under [Your data](#your-data).
 
@@ -376,7 +376,7 @@ Everything stays in `~/.claude/limit-metrics/` (or `$CLAUDE_CONFIG_DIR/limit-met
 | `rollup-YYYY-MM.json` | Each transcript's usage per day: tokens per model, tool calls, active quarter-hours, project, effort level, attribution (skill, plugin, MCP server, subagent type), turn and thinking time, interrupted answers, compactions and limit hits. Claude Code deletes transcripts after `cleanupPeriodDays` (30 by default); the rollups keep your history. |
 | `history-cache.json` | Usage per 15 minutes and limit hits per transcript, keyed by size and modification time. Kept for 10 weeks, also after Claude Code deletes the transcript, so the forecast can compare with up to 9 past weeks. |
 
-### Export (`/limits export` → `export/`)
+### Export (`/limits-forecast export` → `export/`)
 
 | File | Contents |
 | --- | --- |
@@ -425,7 +425,7 @@ plugins/limits-forecast/
 │   ├── stats.ts       # mean, type-7 quantile, CV, OLS slope, ratio estimator, 2-variable WLS
 │   ├── model.ts       # units, buckets, transcript parser, calibration, profile, forecast, scoring, limits line text
 │   ├── retro.ts       # logs, daily rollups, limit hits, CSV/JSON export
-│   └── register.tsx   # wiring: Claude Code events, limits line and warning above the prompt, pane, /limits command
+│   └── register.tsx   # wiring: Claude Code events, limits line and warning above the prompt, pane, /limits-forecast command
 ├── tests/             # model, retro, register and end-to-end flow tests
 └── types/index.d.ts   # the mod's state contract
 ```
