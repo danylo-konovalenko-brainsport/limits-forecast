@@ -241,9 +241,9 @@ Before $\hat k$ is known, the rate is the ordinary least-squares slope of the re
 
 *(`readingRate`, `slope`)*
 
-### 7. 80% prediction interval and risk (empirical quantiles)
+### 7. 80% prediction interval and risk (kernel density estimate)
 
-How much could the rest of this window differ from the forecast? The mod takes empirical quantiles of how the same stretch went in the past:
+How much could the rest of this window differ from the forecast? The mod looks at how the same stretch went in the past:
 
 - Weekly window: the same stretch (now → reset) in each of up to 9 previous weeks.
 - 5-hour window: the same clock stretch on up to 14 previous days of the same kind (workday or weekend), looking back 28 days.
@@ -254,27 +254,29 @@ From the past usages $u_j$ with mean $\bar u$, build one scenario per past stret
 S_j = p + \hat k\cdot\max\!\big(0,\; B + u_j - \bar u\big)
 ```
 
-The interval combines that spread in quadrature with the uncertainty of $\hat k$ itself. The two error sources are treated as independent, and the interval is clipped below at $p$ because usage never goes back:
+The scenarios are smoothed into one distribution, a **Gaussian kernel density estimate**. Each scenario gets a kernel whose width $\sigma$ combines **Silverman's rule-of-thumb bandwidth** $h$ with the uncertainty of $\hat k$ (the two error sources treated as independent):
 
 ```math
-e_k = z_{0.9}\,\operatorname{SE}(\hat k)\,B, \qquad z_{0.9}=1.2816
-```
-
-```math
-\text{lo} = \max\!\Big(p,\; \hat P - \sqrt{(\hat P - Q_{0.1}(S))^2 + e_k^2}\Big),
+F(x) = \frac1n\sum_j \Phi\!\left(\frac{x - S_j}{\sigma}\right),
 \qquad
-\text{hi} = \hat P + \sqrt{(Q_{0.9}(S)-\hat P)^2 + e_k^2}
+\sigma = \sqrt{h^2 + \big(\operatorname{SE}(\hat k)\,B\big)^2},
+\qquad
+h = 0.9\,\min\!\big(s,\ \tfrac{\text{IQR}}{1.34}\big)\,n^{-1/5}
 ```
 
-The quantiles $Q_q$ are sample quantiles of type 7, with linear interpolation between order statistics (Hyndman & Fan, 1996; R's default).
-
-The risk of running out is the empirical exceedance probability:
+$\Phi$ is the standard normal CDF. The **80% prediction interval** and the **risk** are both read from $F$, so they always agree:
 
 ```math
-\text{risk} = \frac{\#\{j : S_j \ge 100\}}{n}
+\text{lo} = \max\big(p,\ F^{-1}(0.1)\big),
+\qquad
+\text{hi} = F^{-1}(0.9),
+\qquad
+\text{risk} = 1 - F(100)
 ```
 
-The interval and risk need ≥ 3 past stretches. With 4 past weeks the risk moves in steps of 25%, and the pane always says how many stretches it compared with. Regular habits and more history give a narrower range; irregular use gives a wider one.
+$F^{-1}$ is found by bisection. The interval is clipped below at $p$ because usage never goes back. Smoothing matters with few past stretches: the 10% and 90% sample quantiles of 4 weeks always lie inside the observed weeks, which makes a raw interval too narrow, and a count-based risk could only move in steps of 1/n. If the scenarios don't vary at all, the plain sample quantiles (type 7, Hyndman & Fan 1996) and the plain share at or above 100% are used.
+
+The interval and risk need ≥ 3 past stretches, and the pane says how many it compared with. Regular habits and more history give a narrower range; irregular use gives a wider one.
 
 ### 8. Regularity
 
@@ -408,6 +410,8 @@ The logic lives in pure functions with no I/O, tested in `tests/`. `register.tsx
 - W. G. Cochran, *Sampling Techniques*, 3rd ed., Wiley, 1977, ch. 6: ratio estimators.
 - R. J. Hyndman, G. Athanasopoulos, *Forecasting: Principles and Practice*, 3rd ed., [otexts.com/fpp3](https://otexts.com/fpp3/): prediction intervals, bootstrapped residuals, benchmark methods, forecast accuracy.
 - R. J. Hyndman, Y. Fan, "Sample Quantiles in Statistical Packages", *The American Statistician* 50(4), 1996: quantile type 7.
+- B. W. Silverman, *Density Estimation for Statistics and Data Analysis*, Chapman & Hall, 1986, §3.4: the rule-of-thumb bandwidth.
+- M. Abramowitz, I. A. Stegun, *Handbook of Mathematical Functions*, 1964, 7.1.26: the normal CDF approximation.
 - G. W. Brier, "Verification of Forecasts Expressed in Terms of Probability", *Monthly Weather Review* 78(1), 1950.
 - T. Gneiting, A. E. Raftery, "Strictly Proper Scoring Rules, Prediction, and Estimation", *JASA* 102(477), 2007: calibration and sharpness.
 - G. Casella, R. L. Berger, *Statistical Inference*, 2nd ed., 2002, §5.5.4: the delta method.

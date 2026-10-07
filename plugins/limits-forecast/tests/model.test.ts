@@ -5,7 +5,7 @@ import {
   usageIndex, weightCheck,
 } from '../hooks/model'
 import type { Buckets, Forecast, ForecastLog, Reading, Turn } from '../hooks/model'
-import { quantile, ratioFit } from '../hooks/stats'
+import { kdeQuantile, kdeTail, normCdf, quantile, ratioFit } from '../hooks/stats'
 
 const NOW = Date.parse('2026-10-07T12:00:00Z')
 const close = (x: number | undefined, v: number) => expect(Math.abs((x ?? NaN) - v)).toBeLessThan(1e-6)
@@ -95,6 +95,18 @@ test('usage index sums ranges and prorates the edge buckets', async () => {
 
 test('stats: quantile interpolates, ratio fit gives k and a standard error', async () => {
   expect(quantile([1, 2, 3, 4], 0.5)).toBe(2.5)
+  // Smoothed tail: symmetric samples split evenly, far ones still count a little.
+  expect(Math.abs(normCdf(1.2816) - 0.9)).toBeLessThan(1e-4)
+  close(kdeTail([90, 110], 100), 0.5)
+  const tail = kdeTail([60, 70, 80, 90], 100)
+  expect(tail).toBeGreaterThan(0.01)
+  expect(tail).toBeLessThan(0.25)
+  // No spread at all: the plain share.
+  expect(kdeTail([80, 80, 80], 100)).toBe(0)
+  // The range and the risk come from one distribution: 10% lie above its 90% point.
+  const xs = [70, 85, 92, 120]
+  expect(Math.abs(kdeTail(xs, kdeQuantile(xs, 0.9, 5), 5) - 0.1)).toBeLessThan(1e-6)
+  expect(kdeQuantile([80, 80, 80], 0.9)).toBe(80)
   const fit = ratioFit([{ y: 2, x: 4, w: 1 }, { y: 3, x: 6, w: 1 }, { y: 5.5, x: 10, w: 1 }])
   close(fit?.k, 10.5 / 20)
   expect(fit?.se).toBeGreaterThan(0)
@@ -221,14 +233,13 @@ test('the risk is the share of past weeks that would run out', async () => {
   const f = forecast({ kind: 'seven_day', p: 60, resetsAt: NOW + 3.5 * DAY, now: NOW, cal: { k: 1 }, between: usageIndex(b), readings: [], prof: profile(b, NOW) })
   expect(f.risk).toBeGreaterThan(0)
   expect(f.risk).toBeLessThan(1)
-  expect(f.risk).toBe(0.6)
-  expect(f.verdict).toBe('slow')
-  // Half the past weeks running out is a coin toss, not "more likely than not".
-  const four: Buckets = Object.fromEntries(Object.entries(b).filter(([k]) => Number(k) > NOW - 29 * DAY))
-  const even = forecast({ kind: 'seven_day', p: 60, resetsAt: NOW + 3.5 * DAY, now: NOW, cal: { k: 1 }, between: usageIndex(four), readings: [], prof: profile(four, NOW) })
-  expect(even.samples).toBe(4)
-  expect(even.risk).toBe(0.5)
-  expect(even.verdict).toBe('ok')
+  // Smoothed: not a multiple of 1/samples.
+  expect((f.risk! * f.samples!) % 1).not.toBe(0)
+  // "More likely than not" means above 50%.
+  expect(f.verdict).toBe(f.risk! > 0.5 ? 'slow' : 'ok')
+  // Uncertainty about k spreads the outcome too, so the risk moves toward 50%.
+  const unsure = forecast({ kind: 'seven_day', p: 60, resetsAt: NOW + 3.5 * DAY, now: NOW, cal: { k: 1, se: 0.3 }, between: usageIndex(b), readings: [], prof: profile(b, NOW) })
+  expect(Math.abs(unsure.risk! - 0.5)).toBeLessThan(Math.abs(f.risk! - 0.5))
   // A pattern forecast alone never says "hold on".
   expect(f.verdict === 'hold').toBe(false)
 })

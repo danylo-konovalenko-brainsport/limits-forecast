@@ -85,3 +85,49 @@ export function ratioOfTwo(rows: { y: number; x1: number; x2: number; w: number 
   const v = vA / (b * b) + (a * a * vB) / b ** 4 - (2 * a * cAB) / b ** 3
   return { ratio, se: Math.sqrt(Math.max(0, v)) }
 }
+
+/** Standard normal CDF (Abramowitz & Stegun 7.1.26, error below 1.5e-7). */
+export function normCdf(z: number): number {
+  const x = Math.abs(z) / Math.SQRT2
+  const t = 1 / (1 + 0.3275911 * x)
+  const erf = 1 - t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429)))) * Math.exp(-x * x)
+  return z >= 0 ? (1 + erf) / 2 : (1 - erf) / 2
+}
+
+/** Silverman's rule-of-thumb bandwidth for a Gaussian kernel. */
+export function bandwidth(xs: number[]): number {
+  if (xs.length < 2) return 0
+  const m = mean(xs)
+  const sd = Math.sqrt(xs.reduce((a, x) => a + (x - m) ** 2, 0) / (xs.length - 1))
+  const iqr = (quantile(xs, 0.75) - quantile(xs, 0.25)) / 1.34
+  return 0.9 * (iqr > 0 ? Math.min(sd, iqr) : sd) * Math.pow(xs.length, -0.2)
+}
+
+/**
+ * P(X ≥ x) from a Gaussian kernel density estimate of the samples, each kernel
+ * widened by `extraSd` (another, independent error source). With no spread at
+ * all it is the plain share of samples at or above x.
+ */
+export function kdeTail(xs: number[], x: number, extraSd = 0): number {
+  const s = Math.hypot(bandwidth(xs), extraSd)
+  if (!(s > 0)) return xs.filter(v => v >= x).length / xs.length
+  return mean(xs.map(v => 1 - normCdf((x - v) / s)))
+}
+
+/**
+ * The q-quantile of the same kernel density estimate as `kdeTail`, found by
+ * bisection, so a range and a risk from it always agree. With no spread at
+ * all it is the plain sample quantile.
+ */
+export function kdeQuantile(xs: number[], q: number, extraSd = 0): number {
+  const s = Math.hypot(bandwidth(xs), extraSd)
+  if (!(s > 0)) return quantile(xs, q)
+  let lo = Math.min(...xs) - 6 * s
+  let hi = Math.max(...xs) + 6 * s
+  for (let i = 0; i < 60; i++) {
+    const mid = (lo + hi) / 2
+    if (mean(xs.map(v => normCdf((mid - v) / s))) < q) lo = mid
+    else hi = mid
+  }
+  return (lo + hi) / 2
+}

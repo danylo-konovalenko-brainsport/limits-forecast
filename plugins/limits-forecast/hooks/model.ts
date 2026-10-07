@@ -1,6 +1,6 @@
 // Pure logic of the limits mod: no `$`, no I/O, so it can be tested directly.
 
-import { cv, mean, quantile, ratioFit, ratioOfTwo, slope } from './stats'
+import { cv, kdeQuantile, kdeTail, mean, ratioFit, ratioOfTwo, slope } from './stats'
 
 export type Verdict = 'ok' | 'slow' | 'hold'
 
@@ -112,7 +112,6 @@ export const LOOKBACK_DAYS = 28
 const MIN_SPAN: Record<string, number> = { five_hour: HOUR, seven_day: 12 * HOUR }
 /** How long a deviation from the usual pattern is expected to last. */
 const TAU: Record<string, number> = { five_hour: HOUR, seven_day: 12 * HOUR }
-const Z80 = 1.2816
 
 const VERDICT_RANK: Record<Verdict, number> = { ok: 0, slow: 1, hold: 2 }
 
@@ -576,16 +575,17 @@ export function forecast(x: ForecastInput): Forecast {
     const base = Math.max(0, usual + (now - then) * tauH * (1 - Math.exp(-hoursToReset / tauH)))
     projected = x.p + k * base
 
-    // Spread: how the same stretch varied in the past (empirical residuals),
-    // combined in quadrature with the uncertainty of k.
+    // Spread: how the same stretch varied in the past, one scenario per past
+    // stretch, smoothed (kernel density) and widened by the uncertainty of k.
+    // The 80% range and the risk both come from that one distribution.
     const past = pastStretches(x.between, x.kind, x.now, x.resetsAt, x.prof.since)
     if (past.length >= 3) {
       const m = mean(past)
       const sims = past.map(u => x.p + k * Math.max(0, base + u - m))
-      const kErr = Z80 * (x.cal?.se ?? 0) * base
-      lo = Math.max(x.p, projected - Math.hypot(Math.max(0, projected - quantile(sims, 0.1)), kErr))
-      hi = projected + Math.hypot(Math.max(0, quantile(sims, 0.9) - projected), kErr)
-      risk = sims.filter(s => s >= 100).length / sims.length
+      const kSd = (x.cal?.se ?? 0) * base
+      lo = Math.max(x.p, kdeQuantile(sims, 0.1, kSd))
+      hi = kdeQuantile(sims, 0.9, kSd)
+      risk = kdeTail(sims, 100, kSd)
       samples = past.length
     }
   }
