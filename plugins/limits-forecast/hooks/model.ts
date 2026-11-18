@@ -15,6 +15,8 @@ export type Turn = {
   cw: number
   cr: number
   out: number
+  /** Of `cw`, the tokens written to the 1-hour cache (2× input) rather than the 5-minute one (1.25×). */
+  cw1h?: number
   sub?: boolean
   /** Transcripts only: tool names the message called, effort level, what it is attributed to. */
   tools?: string[]
@@ -25,11 +27,12 @@ export type Turn = {
   aborted?: boolean
 }
 
-/** Usage summed per 15 minutes: [units, subagent units, opus units]. */
-export type Buckets = Record<string, [number, number, number]>
-
-/** Usage between two times, edge buckets prorated: [units, subagent units, opus units]. */
-export type Between = (from: number, to: number) => [number, number, number]
+/** Usage in one bucket or stretch: [units, subagent units, Opus units, Fable units]. */
+export type Cells = [number, number, number, number]
+/** Usage summed per 15 minutes. */
+export type Buckets = Record<string, Cells>
+/** Usage between two times, edge buckets prorated. */
+export type Between = (from: number, to: number) => Cells
 
 /** What the mod has learned about converting usage units into percent for one window. */
 export type Calib = {
@@ -64,6 +67,8 @@ export type ForecastLog = {
   n?: number
   /** Baseline: the current speed held constant. */
   b?: number
+  /** The correction the forecast was scaled by (1 when absent), so scoring can undo it. */
+  c?: number
 }
 
 export type Forecast = {
@@ -91,6 +96,10 @@ export type Forecast = {
   pace?: number
   /** Percent per day still available until reset (weekly). */
   perDayLeft?: number
+  /** The scored-bias correction applied to k, when not 1. */
+  correction?: number
+  /** A model's own window: how much of the shared weekly limit the model may take and has taken. */
+  share?: Share
   verdict: Verdict
   headline: string
 }
@@ -102,8 +111,22 @@ export const HOUR = 60 * MINUTE
 export const DAY = 24 * HOUR
 export const BUCKET = 15 * MINUTE
 export const WINDOW_MS: Record<string, number> = { five_hour: 5 * HOUR, seven_day: 7 * DAY }
-export const LABEL: Record<string, string> = { five_hour: '5-hour', seven_day: 'Weekly' }
-export const SHORT: Record<string, string> = { five_hour: '5h', seven_day: 'wk' }
+const LABEL: Record<string, string> = { five_hour: '5-hour', seven_day: 'Weekly' }
+const SHORT: Record<string, string> = { five_hour: '5h', seven_day: 'wk' }
+
+/** The weekly windows: the shared one and each model's own (`seven_day_fable`). */
+export const isWeekly = (kind: string) => kind === 'seven_day' || kind.startsWith('seven_day_')
+/** The model a weekly window of its own counts, `fable` for `seven_day_fable`; undefined for the shared windows. */
+export const scopeOf = (kind: string) => (kind.startsWith('seven_day_') ? kind.slice('seven_day_'.length) : undefined)
+/** The shared window a kind runs like: its length and time constants. */
+const baseKind = (kind: string) => (isWeekly(kind) ? 'seven_day' : kind)
+/** A window's name in the pane (`Weekly`, `Fable`) and in the limits line (`wk`, `fable`). */
+export function labelOf(kind: string): string {
+  const scope = scopeOf(kind)?.replace(/_/g, ' ')
+  return LABEL[kind] ?? (scope ? scope.charAt(0).toUpperCase() + scope.slice(1) : kind)
+}
+export const shortOf = (kind: string) => SHORT[kind] ?? scopeOf(kind) ?? kind
+
 export const VERDICT_TEXT: Record<Verdict, string> = { ok: 'OK', slow: 'SLOW DOWN', hold: 'HOLD ON' }
 
 /** Calibration counts as usable once this many percent points were matched. */
@@ -126,50 +149,83 @@ export const worst = (vs: Verdict[]): Verdict =>
 
 export const isWorse = (a: Verdict, b: Verdict) => VERDICT_RANK[a] > VERDICT_RANK[b]
 
-export const isOpus = (model: string) => model.toLowerCase().includes('opus')
+/**
+ * API list prices by family and generation: input $/MTok and cache reads as a
+ * share of input. Unknown models count as the current Sonnet.
+ */
+const PRICES: [RegExp, number, number][] = [
+  [/fable|mythos/, 10, 0.025],
+  [/opus-5-5/, 4, 0.05],
+  [/opus-4-(1-)?2025/, 15, 0.1],
+  [/opus/, 5, 0.1],
+  [/sonnet-5/, 2, 0.1],
+  [/sonnet/, 3, 0.1],
+  [/haiku-5/, 0.1, 0.1],
+  [/haiku/, 1, 0.1],
+]
 
-/** Relative price of a model family, used to weight its tokens. */
-export function modelFactor(model: string): number {
+export function price(model: string): { input: number; cacheRead: number } {
   const m = model.toLowerCase()
-  if (m.includes('opus')) return 5
-  if (m.includes('haiku')) return 1
-  return 3
+  const row = PRICES.find(([re]) => re.test(m))
+  return row ? { input: row[1], cacheRead: row[2] } : { input: 2, cacheRead: 0.1 }
+}
+
+/** The model families whose weight against the limit the mod checks on its own. */
+export type Family = 'opus' | 'fable'
+export const FAMILIES: Family[] = ['opus', 'fable']
+export const FAMILY_LABEL: Record<Family, string> = { opus: 'Opus', fable: 'Fable' }
+/** Where each family's usage sits in a bucket. */
+export const FAMILY_CELL: Record<Family, 2 | 3> = { opus: 2, fable: 3 }
+
+export function family(model: string): Family | 'other' {
+  const m = model.toLowerCase()
+  return /fable|mythos/.test(m) ? 'fable' : m.includes('opus') ? 'opus' : 'other'
 }
 
 /**
  * A turn's cost in "units": tokens weighted like API list prices (cache reads
- * are cheap, output is expensive, Opus costs more). One unit is about one US
+ * are cheap, output is expensive, Fable costs more). One unit is about one US
  * dollar at those prices.
  */
-export function units(t: Pick<Turn, 'model' | 'in' | 'cw' | 'cr' | 'out'>): number {
-  return (modelFactor(t.model) * (t.in + 1.25 * t.cw + 0.1 * t.cr + 5 * t.out)) / 1e6
+export function units(t: Pick<Turn, 'model' | 'in' | 'cw' | 'cr' | 'out' | 'cw1h'>): number {
+  const { input, cacheRead } = price(t.model)
+  const cw1h = t.cw1h ?? 0
+  return (input * (t.in + 1.25 * (t.cw - cw1h) + 2 * cw1h + cacheRead * t.cr + 5 * t.out)) / 1e6
 }
 
 export const bucketKey = (t: number) => String(Math.floor(t / BUCKET) * BUCKET)
 
+const ZERO: Cells = [0, 0, 0, 0]
+const plus = (a: Cells, b: Cells): Cells => [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
+
 export function addToBuckets(b: Buckets, turn: Turn) {
   const k = bucketKey(turn.t)
   const u = units(turn)
-  const cur = b[k] ?? [0, 0, 0]
-  b[k] = [cur[0] + u, cur[1] + (turn.sub ? u : 0), cur[2] + (isOpus(turn.model) ? u : 0)]
+  const fam = family(turn.model)
+  b[k] = plus(b[k] ?? ZERO, [u, turn.sub ? u : 0, fam === 'opus' ? u : 0, fam === 'fable' ? u : 0])
+}
+
+/**
+ * The buckets as a model's own window counts them: that family's usage alone
+ * (its subagent share is not kept apart). A model the mod keeps no cell for
+ * gives none, and its window is forecast from its readings.
+ */
+export function familyBuckets(b: Buckets, fam: Family | 'other'): Buckets {
+  if (fam === 'other') return {}
+  const cell = FAMILY_CELL[fam]
+  return Object.fromEntries(Object.entries(b).map(([k, v]) => [k, [v[cell], 0, 0, 0]]))
 }
 
 export function mergeBuckets(into: Buckets, from: Buckets) {
-  for (const [k, v] of Object.entries(from)) {
-    const cur = into[k] ?? [0, 0, 0]
-    into[k] = [cur[0] + v[0], cur[1] + v[1], cur[2] + v[2]]
-  }
+  for (const [k, v] of Object.entries(from)) into[k] = plus(into[k] ?? ZERO, v)
 }
 
 /** Prefix sums over the buckets, so any range sums in O(log n). */
 export function usageIndex(b: Buckets): Between {
   const ks = Object.keys(b).map(Number).sort((x, y) => x - y)
   const vs = ks.map(k => b[String(k)]!)
-  const cum: [number, number, number][] = [[0, 0, 0]]
-  for (const v of vs) {
-    const c = cum[cum.length - 1]!
-    cum.push([c[0] + v[0], c[1] + v[1], c[2] + v[2]])
-  }
+  const cum: Cells[] = [ZERO]
+  for (const v of vs) cum.push(plus(cum[cum.length - 1]!, v))
   const lower = (x: number) => {
     let lo = 0
     let hi = ks.length
@@ -181,18 +237,18 @@ export function usageIndex(b: Buckets): Between {
     return lo
   }
   return (from, to) => {
-    if (!(to > from)) return [0, 0, 0]
+    if (!(to > from)) return [0, 0, 0, 0]
     const i0 = lower(from - BUCKET + 1)
     const i1 = lower(to)
-    if (i1 <= i0) return [0, 0, 0]
+    if (i1 <= i0) return [0, 0, 0, 0]
     const a = cum[i0]!
     const z = cum[i1]!
-    const res: [number, number, number] = [z[0] - a[0], z[1] - a[1], z[2] - a[2]]
+    const res: Cells = [z[0] - a[0], z[1] - a[1], z[2] - a[2], z[3] - a[3]]
     for (const i of i1 - 1 === i0 ? [i0] : [i0, i1 - 1]) {
       const start = ks[i]!
       const outside = 1 - (Math.min(start + BUCKET, to) - Math.max(start, from)) / BUCKET
       const v = vs[i]!
-      for (let j = 0; j < 3; j++) res[j]! -= v[j]! * outside
+      for (let j = 0; j < 4; j++) res[j]! -= v[j]! * outside
     }
     return res
   }
@@ -289,6 +345,8 @@ export function parseTranscript(text: string): Transcript {
       out: u.output_tokens ?? 0,
       sub: d.isSidechain === true,
     }
+    const cw1h = u.cache_creation?.ephemeral_1h_input_tokens
+    if (typeof cw1h === 'number' && cw1h > 0) turn.cw1h = Math.min(cw1h, turn.cw)
     if (tools.length) turn.tools = tools
     const effort = d.perTurnEffort ?? d.effort
     if (typeof effort === 'string') turn.effort = effort
@@ -301,6 +359,39 @@ export function parseTranscript(text: string): Transcript {
   }
   out.hits = [...hits.values()]
   return out
+}
+
+/** How much of the shared weekly limit a model may take and has taken, in percent of it. */
+export type Share = { used: number; allowance: number }
+/** A limit window as Claude Code reports the shared ones, plus what only a model's own has. */
+export type Limit = { kind: string; percentUsed: number; resetsAt?: string; share?: Share }
+
+/**
+ * The per-model weekly windows in the answer of Anthropic's usage endpoint,
+ * what /usage shows as "Current week (Fable)": the `limits` rows of kind
+ * `weekly_scoped`, named by `scope.model.display_name`, with their place in
+ * `weekly_scoped_shares`. The reset is rounded to the minute: the endpoint's
+ * carries microseconds, and readings of one window are grouped by it. A shape
+ * it does not know gives none.
+ */
+export function scopedLimits(body: unknown): Limit[] {
+  const b = body as any
+  if (!Array.isArray(b?.limits)) return []
+  const shares: any[] = Array.isArray(b.weekly_scoped_shares) ? b.weekly_scoped_shares : []
+  return b.limits.flatMap((l: any, i: number): Limit[] => {
+    const name = l?.scope?.model?.display_name
+    if (l?.kind !== 'weekly_scoped' || typeof name !== 'string' || typeof l.percent !== 'number' || !Number.isFinite(l.percent)) return []
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')
+    if (!slug) return []
+    const t = typeof l.resets_at === 'number' ? l.resets_at * 1000 : Date.parse(String(l.resets_at).replace(/(\.\d{3})\d+/, '$1'))
+    const s = shares.find(x => x?.limit_index === i)
+    const limit: Limit = { kind: `seven_day_${slug}`, percentUsed: Math.round(l.percent * 10) / 10 }
+    if (Number.isFinite(t)) limit.resetsAt = new Date(Math.round(t / MINUTE) * MINUTE).toISOString()
+    if (typeof s?.used_percent_of_weekly === 'number' && typeof s.allowance_percent_of_weekly === 'number') {
+      limit.share = { used: s.used_percent_of_weekly, allowance: s.allowance_percent_of_weekly }
+    }
+    return [limit]
+  })
 }
 
 /** Hits of the same window seen in several transcripts: the first counts, retries add up. */
@@ -321,7 +412,7 @@ export function mergeHits(hits: Hit[]): Hit[] {
  */
 export function hitReadings(hits: Hit[]): Reading[] {
   return hits.flatMap(h => {
-    const span = WINDOW_MS[h.kind]
+    const span = WINDOW_MS[baseKind(h.kind)]
     const end = Date.parse(h.r)
     if (!span || !Number.isFinite(end)) return []
     return [
@@ -329,6 +420,22 @@ export function hitReadings(hits: Hit[]): Reading[] {
       { t: h.t, kind: h.kind, p: 100, r: h.r },
     ]
   })
+}
+
+/**
+ * A model's own window is first read somewhere in its middle, but it began at
+ * 0% a week before its reset. That start is a reading too, so the first read
+ * already teaches tokens → % from the model's usage since the window began.
+ */
+export function startReadings(readings: Reading[]): Reading[] {
+  const out = new Map<string, Reading>()
+  for (const x of readings) {
+    const end = x.r ? Date.parse(x.r) : NaN
+    const span = WINDOW_MS[baseKind(x.kind)]
+    if (scopeOf(x.kind) === undefined || !span || !Number.isFinite(end)) continue
+    out.set(`${x.kind}|${x.r}`, { t: end - span, kind: x.kind, p: 0, r: x.r })
+  }
+  return [...out.values()]
 }
 
 /**
@@ -356,7 +463,7 @@ export function stretches(readings: Reading[], kind: string): [Reading, Reading]
   const byReset = new Map<string, Reading[]>()
   for (const x of readings) if (x.kind === kind) byReset.set(x.r ?? '', [...(byReset.get(x.r ?? '') ?? []), x])
   const out: [Reading, Reading][] = []
-  const span = MIN_SPAN[kind] ?? HOUR
+  const span = MIN_SPAN[baseKind(kind)] ?? HOUR
   for (const xs of byReset.values()) {
     xs.sort((a, b) => a.t - b.t)
     let start = xs[0]
@@ -422,34 +529,35 @@ export function calibrate(readings: Reading[], between: Between, kind: string, n
 }
 
 /**
- * Checks the assumed Opus weight: fits the points moved against Opus and other
- * usage separately. 1 means Opus is weighted right; 1.3 means it costs 30% more
- * of the limit than assumed.
+ * Checks a family's assumed weight: fits the points moved against that
+ * family's usage and all other usage separately. 1 means it is weighted
+ * right; 1.3 means it costs 30% more of the limit than assumed.
  */
-export function weightCheck(readings: Reading[], between: Between, now: number) {
+export function weightCheck(readings: Reading[], between: Between, now: number, fam: Family = 'opus') {
+  const cell = FAMILY_CELL[fam]
   const rows = stretches(readings, 'five_hour')
     .filter(([, b]) => now - b.t <= LOOKBACK_DAYS * DAY)
     .map(([a, b]) => {
-      const [u, , opus] = between(a.t, b.t)
-      return { y: b.p - a.p, x1: opus, x2: u - opus, w: decay(now - b.t) }
+      const u = between(a.t, b.t)
+      return { y: b.p - a.p, x1: u[cell], x2: u[0] - u[cell], w: decay(now - b.t) }
     })
   const r = ratioOfTwo(rows)
   return r && { ...r, n: rows.length }
 }
 
 /**
- * The checked Opus weight once it clearly differs from the assumed one (more
- * than 2 standard errors away from 1, and measured to within 25%); else 1.
+ * The checked weight once it clearly differs from the assumed one (more than
+ * 2 standard errors away from 1, and measured to within 25%); else 1.
  */
-export function opusWeight(check?: { ratio: number; se: number }): number {
+export function familyWeight(check?: { ratio: number; se: number }): number {
   if (!check || check.se > 0.25 * check.ratio || Math.abs(check.ratio - 1) <= 2 * check.se) return 1
   return check.ratio
 }
 
-/** Buckets with Opus usage counted `r` times as heavy. */
-export function reweightOpus(b: Buckets, r: number): Buckets {
-  if (r === 1) return b
-  return Object.fromEntries(Object.entries(b).map(([k, [u, s, o]]) => [k, [u + (r - 1) * o, s, o * r]]))
+/** Buckets with each family's usage counted that many times as heavy. */
+export function reweight(b: Buckets, w: Record<Family, number>): Buckets {
+  if (w.opus === 1 && w.fable === 1) return b
+  return Object.fromEntries(Object.entries(b).map(([k, [u, s, o, f]]) => [k, [u + (w.opus - 1) * o + (w.fable - 1) * f, s, o * w.opus, f * w.fable]]))
 }
 
 const localDayStart = (t: number) => {
@@ -538,7 +646,7 @@ export function expectedUnits(perHour: number[], from: number, to: number): numb
  */
 export function pastStretches(between: Between, kind: string, now: number, end: number, since: number): number[] {
   const out: number[] = []
-  if (kind === 'seven_day') {
+  if (isWeekly(kind)) {
     for (let i = 1; i <= 9; i++) {
       const s = now - i * 7 * DAY
       if (s < since) break
@@ -575,6 +683,12 @@ export type ForecastInput = {
   readings: Reading[]
   prof?: Profile
   tune?: Tuning
+  /** The verdict this window had last time, so it does not flap around the risk threshold. */
+  prev?: Verdict
+  /** The scored-bias correction for k (`correction`), 1 when none. */
+  correction?: number
+  /** A model's own window: its place in the shared weekly limit, handed on as it is. */
+  share?: Share
 }
 
 /**
@@ -583,8 +697,8 @@ export type ForecastInput = {
  * burst does not last until the reset. The deviation is measured over the
  * last hour (5-hour window) or day (week).
  */
-export function expectedBase(prof: Profile, between: Between, kind: string, now: number, end: number, tau = TAU[kind] ?? HOUR): number {
-  const lookback = kind === 'seven_day' ? DAY : HOUR
+export function expectedBase(prof: Profile, between: Between, kind: string, now: number, end: number, tau = TAU[baseKind(kind)] ?? HOUR): number {
+  const lookback = isWeekly(kind) ? DAY : HOUR
   const lbH = lookback / HOUR
   const tauH = tau / HOUR
   const usual = expectedUnits(prof.perHour, now, end)
@@ -620,7 +734,7 @@ export type Tuning = {
   coverage?: number
 }
 
-export const defaultTuning = (kind: string): Tuning => ({ tau: TAU[kind] ?? HOUR, halfLife: HALF_LIFE, scale: 1, bias: 1, n: 0, independent: 0 })
+export const defaultTuning = (kind: string): Tuning => ({ tau: TAU[baseKind(kind)] ?? HOUR, halfLife: HALF_LIFE, scale: 1, bias: 1, n: 0, independent: 0 })
 
 /**
  * Non-overlapping replayed forecasts needed before tuned settings are used.
@@ -642,7 +756,7 @@ export function tune(b: Buckets, kind: string, now: number, horizon: number): Tu
   const between = usageIndex(b)
   const since = firstBucket(b)
   if (!Number.isFinite(since) || !(horizon > 0)) return t0
-  const isWeek = kind === 'seven_day'
+  const isWeek = isWeekly(kind)
   const step = isWeek ? 6 * HOUR : 2 * HOUR
   const taus = (isWeek ? [3, 12, 24, 48] : [0.25, 1, 2, 4]).map(h => h * HOUR)
   const lives = [7, 14, 28].map(d => d * DAY)
@@ -710,15 +824,39 @@ export function tune(b: Buckets, kind: string, now: number, horizon: number): Tu
   }
 }
 
+/** Whether the current speed reaches the limit before the reset and soon: 45 min for the 5-hour window, 6 h for the week. */
+export function runsOutSoon(kind: string, msToLimit?: number, msToReset?: number): boolean {
+  const near = isWeekly(kind) ? 6 * HOUR : 45 * MINUTE
+  return msToLimit !== undefined && msToReset !== undefined && msToLimit < msToReset && msToLimit < near
+}
+
+export type VerdictInput = { kind: string; p: number; risk?: number; projected?: number; msToLimit?: number; msToReset?: number; prev?: Verdict }
+
+/**
+ * Hard data (the limit itself, or the current speed hitting it soon) can say
+ * "hold on"; a forecast from the usual pattern only ever says "slow down".
+ * That starts above 55% risk and holds until the risk is under 45%, so the
+ * verdict does not flap around one number.
+ */
+export function verdictFor(x: VerdictInput): Verdict {
+  if (x.p >= 95 || runsOutSoon(x.kind, x.msToLimit, x.msToReset)) return 'hold'
+  const wasOver = x.prev === 'slow' || x.prev === 'hold'
+  const forecastOver = x.risk !== undefined ? x.risk > (wasOver ? 0.45 : 0.55) : x.projected !== undefined && x.projected > 100
+  if (forecastOver || x.p >= 85) return 'slow'
+  return 'ok'
+}
+
 export function forecast(x: ForecastInput): Forecast {
-  const L = WINDOW_MS[x.kind]
-  const label = LABEL[x.kind] ?? x.kind
+  const L = WINDOW_MS[baseKind(x.kind)]
+  const label = labelOf(x.kind)
   const msToReset = x.resetsAt !== undefined ? Math.max(0, x.resetsAt - x.now) : undefined
-  const isWeek = x.kind === 'seven_day'
+  const isWeek = isWeekly(x.kind)
   // The 5-hour window is judged on the last hour; the week on the last day,
   // since nobody works 24 hours straight.
   const lookback = isWeek ? DAY : HOUR
-  const k = x.cal?.k
+  // k as learned, scaled by how far past forecasts ran off at percent level.
+  const c = x.correction ?? 1
+  const k = x.cal?.k === undefined ? undefined : x.cal.k * c
 
   let rate: number | undefined
   let rateBasis = 'not enough data yet'
@@ -755,7 +893,7 @@ export function forecast(x: ForecastInput): Forecast {
     const past = pastStretches(x.between, x.kind, x.now, x.resetsAt, x.prof.since)
     if (past.length >= 3) {
       const sims = scenarios(base, past, t.scale).map(u => x.p + k * u)
-      const kSd = (x.cal?.se ?? 0) * base
+      const kSd = (x.cal?.se ?? 0) * c * base
       lo = Math.max(x.p, kdeQuantile(sims, 0.1, kSd))
       hi = kdeQuantile(sims, 0.9, kSd)
       risk = kdeTail(sims, 100, kSd)
@@ -767,29 +905,25 @@ export function forecast(x: ForecastInput): Forecast {
     ? Math.max(0, 100 - x.p) / Math.max(msToReset / DAY, 1 / 24)
     : undefined
 
-  // Hard data (the limit itself, or the current speed hitting it soon) can say
-  // "hold on"; a forecast from the usual pattern only ever says "slow down".
-  const near = isWeek ? DAY : 45 * MINUTE
-  const runsOutSoon = msToLimit !== undefined && msToReset !== undefined && msToLimit < msToReset && msToLimit < near
-  const forecastOver = risk !== undefined ? risk > 0.5 : projected !== undefined && projected > 100
-  let verdict: Verdict = 'ok'
-  if (x.p >= 95 || runsOutSoon) verdict = 'hold'
-  else if (forecastOver || x.p >= 85) verdict = 'slow'
+  const soon = runsOutSoon(x.kind, msToLimit, msToReset)
+  const verdict = verdictFor({ kind: x.kind, p: x.p, risk, projected, msToLimit, msToReset, prev: x.prev })
 
   const unit = isWeek ? 'weeks' : 'days'
   const range = lo !== undefined && hi !== undefined ? ` (80%: ${fmtRange(lo, hi)})` : ''
   let headline: string
   if (x.p >= 95) headline = `${label} limit almost used (${fmtPct(x.p)}).`
-  else if (runsOutSoon) headline = `${label}: at this speed you hit the limit in ~${dur(msToLimit!)}, reset is in ${dur(msToReset!)}.`
+  else if (soon) headline = `${label}: at this speed you hit the limit in ~${dur(msToLimit!)}, reset is in ${dur(msToReset!)}.`
   else if (risk !== undefined && risk > 0.5) headline = `${label}: ${fmtPct(risk * 100)} risk of running out before the reset in ${dur(msToReset!)} (compared with ${samples} past ${unit}).`
-  else if (projected !== undefined && projected > 100 && msToLimit !== undefined && msToReset !== undefined) headline = `${label}: at this speed you hit the limit in ~${dur(msToLimit)}, reset is in ${dur(msToReset)}.`
-  else if (projected !== undefined && msToReset !== undefined) headline = `${label}: on track for ~${fmtPct(Math.min(projected, 100))}${range} at reset in ${dur(msToReset)}.`
+  else if (projected !== undefined && projected > 100 && msToReset !== undefined) headline = `${label}: set to run out before the reset in ${dur(msToReset)}, forecast ~${fmtPct(projected)}${range}.`
+  else if (projected !== undefined && msToReset !== undefined) headline = `${label}: on track for ~${fmtPct(projected)}${range} at reset in ${dur(msToReset)}.`
   else if (msToReset !== undefined) headline = `${label}: ${fmtPct(x.p)} used, reset in ${dur(msToReset)}.`
   else headline = `${label}: ${fmtPct(x.p)} used.`
 
   const f: Forecast = { kind: x.kind, label, p: x.p, rateBasis, verdict, headline }
   Object.assign(f, strip({ msToReset, rate, msToLimit, projected, lo, hi, risk, samples, baseline, pace, perDayLeft }))
   if (samples !== undefined) f.sampleUnit = unit
+  if (c !== 1) f.correction = c
+  if (x.share) f.share = x.share
   return f
 }
 
@@ -800,13 +934,15 @@ const strip = <T extends Record<string, unknown>>(o: T): Partial<T> =>
 export function toLog(f: Forecast, t: number, r: string | undefined): ForecastLog | undefined {
   if (f.projected === undefined || !r) return undefined
   const round = (v?: number) => (v === undefined ? undefined : Math.round(v * 10) / 10)
-  return strip({ t, kind: f.kind, r, p: f.p, pt: round(f.projected)!, lo: round(f.lo), hi: round(f.hi), risk: round(f.risk), n: f.samples, b: round(f.baseline) }) as ForecastLog
+  return strip({ t, kind: f.kind, r, p: f.p, pt: round(f.projected)!, lo: round(f.lo), hi: round(f.hi), risk: round(f.risk), n: f.samples, b: round(f.baseline), c: round(f.correction) }) as ForecastLog
 }
 
 export type Quality = {
   kind: string
   /** Forecasts scored (windows that have reset). */
   n: number
+  /** Distinct windows among them. */
+  windows: number
   /** Mean absolute error of the point forecast, in percent points. */
   mae?: number
   /** Mean error: positive means forecasts ran high. */
@@ -821,6 +957,8 @@ export type Quality = {
   nRisk: number
   /** 1 − MAE / MAE of the constant-speed baseline: above 0 beats it. */
   skill?: number
+  /** Σ actual ÷ Σ forecast increase, the forecasts taken before any correction they carried. */
+  ratio?: number
 }
 
 /**
@@ -829,23 +967,21 @@ export type Quality = {
  * per window and hour counts.
  */
 export function evaluate(logs: ForecastLog[], readings: Reading[], kind: string, now: number, since = now - LOOKBACK_DAYS * DAY): Quality {
-  const final = new Map<string, { p: number; t: number }>()
-  for (const x of readings) {
-    if (x.kind !== kind || !x.r) continue
-    const cur = final.get(x.r)
-    final.set(x.r, { p: Math.max(cur?.p ?? 0, x.p), t: Math.max(cur?.t ?? 0, x.t) })
-  }
+  const final = new Map<string, number>()
+  for (const x of readings) if (x.kind === kind && x.r) final.set(x.r, Math.max(final.get(x.r) ?? 0, x.p))
   const seen = new Set<string>()
   const scored: { f: ForecastLog; y: number }[] = []
   for (const f of [...logs].sort((a, b) => a.t - b.t)) {
     if (f.kind !== kind || f.t < since || !(Date.parse(f.r) <= now)) continue
-    const out = final.get(f.r)
+    // The window's last reading is its outcome, also when it came before the
+    // forecast: usage after it would have moved the window and been read.
+    const y = final.get(f.r)
     const key = `${f.r}|${Math.floor(f.t / HOUR)}`
-    if (!out || out.t < f.t || seen.has(key)) continue
+    if (y === undefined || seen.has(key)) continue
     seen.add(key)
-    scored.push({ f, y: Math.min(out.p, 100) })
+    scored.push({ f, y: Math.min(y, 100) })
   }
-  const q: Quality = { kind, n: scored.length, nInterval: 0, nRisk: 0 }
+  const q: Quality = { kind, n: scored.length, windows: new Set(scored.map(s => s.f.r)).size, nInterval: 0, nRisk: 0 }
   if (scored.length === 0) return q
   const err = scored.map(s => Math.min(s.f.pt, 100) - s.y)
   q.mae = mean(err.map(Math.abs))
@@ -864,7 +1000,29 @@ export function evaluate(logs: ForecastLog[], readings: Reading[], kind: string,
   if (bl.length && blErr > 0) {
     q.skill = 1 - bl.reduce((a, s) => a + Math.abs(Math.min(s.f.pt, 100) - s.y), 0) / blErr
   }
+  // How far the increases ran off, a ratio estimator again; both sides capped
+  // at the room the window had, so a run-out forecast right counts as right.
+  let actual = 0
+  let predicted = 0
+  for (const s of scored) {
+    const room = Math.max(0, 100 - s.f.p)
+    actual += clamp(s.y - s.f.p, 0, room)
+    predicted += clamp((s.f.pt - s.f.p) / (s.f.c ?? 1), 0, room)
+  }
+  if (predicted > 0) q.ratio = actual / predicted
   return q
+}
+
+/**
+ * What k is scaled by: the scored ratio once 5 forecasts over 3 windows are
+ * in, clipped to 0.5–1.5, and 1 when within 5% of it. Catches a k learned too
+ * high from usage elsewhere (claude.ai, another machine) and the weeks the
+ * replay cannot tune yet.
+ */
+export function correction(q: Pick<Quality, 'ratio' | 'n' | 'windows'>): number {
+  if (q.ratio === undefined || q.n < 5 || q.windows < 3) return 1
+  const c = clamp(q.ratio, 0.5, 1.5)
+  return Math.abs(c - 1) < 0.05 ? 1 : c
 }
 
 /** How regular weekly usage is: coefficient of variation of complete past weeks. */
@@ -887,6 +1045,12 @@ export type SuggestionInput = {
   context?: number
 }
 
+/** What to switch a family to for routine work, and the model that stands for the family in the price table. */
+const SWAP: Record<Family, { model: string; to: [string, string][] }> = {
+  fable: { model: 'claude-fable-5-1', to: [['Opus 5.5', 'claude-opus-5-5'], ['Sonnet 5.5', 'claude-sonnet-5-5']] },
+  opus: { model: 'claude-opus-5-5', to: [['Sonnet 5.5', 'claude-sonnet-5-5']] },
+}
+
 export function suggestions(x: SuggestionInput): Tip[] {
   const out: Tip[] = []
   const short = x.forecasts.find(f => f.kind === 'five_hour')
@@ -894,14 +1058,25 @@ export function suggestions(x: SuggestionInput): Tip[] {
   // Tight: not OK, or OK but the forecast or risk says it is close.
   const tight = (f?: Forecast) => !!f && (f.verdict !== 'ok' || (f.projected ?? 0) >= 100 || (f.risk ?? 0) >= 0.5)
   const anyPressure = x.forecasts.some(f => tight(f))
-  const [total, sub, opus] = x.between(x.now - 5 * HOUR, x.now)
+  const [total, sub, opus, fable] = x.between(x.now - 5 * HOUR, x.now)
 
   if (anyPressure) {
     if ((x.context ?? 0) > 120_000) {
       out.push({ id: 'context', text: `Your context is ~${Math.round((x.context ?? 0) / 1000)}k tokens and every message re-sends it: /compact, or /clear when you switch topics.` })
     }
-    if (total > 0 && opus / total > 0.6) {
-      out.push({ id: 'model', text: 'Most recent usage is Opus. Sonnet for routine work (/model) makes the same limit last about 1.7× longer.' })
+    const heavy: Family | undefined = total > 0 && fable / total > 0.6 ? 'fable' : total > 0 && opus / total > 0.6 ? 'opus' : undefined
+    // A model's own window is tight: only that model fills it, so switching is the whole remedy.
+    const own = x.forecasts.find(f => scopeOf(f.kind) !== undefined && tight(f))
+    if (own) {
+      out.push({ id: 'model', text: `${own.label} has a weekly limit of its own and it is at ${fmtPct(own.p)}: other models don't count against it, so keep ${own.label} for the work that needs it (/model).` })
+    } else if (heavy) {
+      const s = SWAP[heavy]
+      const times = (id: string) => `${Math.round((price(s.model).input / price(id).input) * 10) / 10}×`
+      const [first, second] = s.to
+      out.push({
+        id: 'model',
+        text: `Most recent usage is ${FAMILY_LABEL[heavy]}. ${first![0]} for routine work (/model) makes the same limit last about ${times(first![1])} longer${second ? `, ${second[0]} about ${times(second[1])}` : ''}.`,
+      })
     }
     if (total > 0 && sub / total > 0.4) {
       out.push({ id: 'subagents', text: `Subagents made ${Math.round((sub / total) * 100)}% of recent usage: fewer parallel agents slow the burn most.` })
@@ -955,39 +1130,72 @@ export function dur(ms: number): string {
 }
 
 /**
- * The limits line as plain text: the same fields for every window, OK or not,
- * in the same order, then when Claude Code last reported them. A dash stands
- * for what is not known yet.
- *   5h 42% ↻ 2h30 → 68% (61–77) risk 0% ● OK   │   wk 61% ↻ 3d → 104% (88–119) risk 75% ● SLOW DOWN   · 14:02
- */
-export function statusText(forecasts: Forecast[], at?: number): string | undefined {
-  if (forecasts.length === 0) return undefined
-  const parts = forecasts.map(f => {
-    const s = statusParts(f)
-    return `${s.name} ${s.pct} ↻ ${s.reset} → ${s.ahead}${s.range ? ` (${s.range})` : ''} risk ${s.risk} ● ${s.verdict}`
-  })
-  return parts.join('   │   ') + (at === undefined ? '' : `   · ${hhmm(at)}`)
-}
-
-/**
- * One window's fields, apart so they can be drawn in their own colors. `tone`
- * colors the forecast: bad over 100%, warn when it is near or its range
- * reaches past the limit.
+ * One window's fields of the limits line, apart so they can be drawn in their
+ * own colors. `tone` colors the forecast: bad over 100%, warn when it is near
+ * or its range reaches past the limit.
  */
 export function statusParts(f: Forecast) {
   const tone: 'good' | 'warn' | 'bad' | undefined = f.projected === undefined
     ? undefined
     : f.projected > 100 ? 'bad' : f.projected >= 90 || (f.hi ?? 0) > 100 ? 'warn' : 'good'
   return {
-    name: SHORT[f.kind] ?? f.kind,
+    name: shortOf(f.kind),
     pct: fmtPct(f.p),
     reset: f.msToReset === undefined ? '–' : dur(f.msToReset),
     ahead: f.projected === undefined ? '–' : fmtPct(f.projected),
-    range: f.lo !== undefined && f.hi !== undefined ? `${Math.round(f.lo)}–${Math.round(f.hi)}` : undefined,
     risk: f.risk === undefined ? '–' : fmtPct(f.risk * 100),
     verdict: VERDICT_TEXT[f.verdict],
     tone,
   }
+}
+
+/** Cells of the small bar in the limits line. It draws one more character, the limit mark. */
+export const LINE_BAR = 10
+
+/** What the limits line shows: `fitLine` picks the fullest set that fits the terminal. */
+export type LineOpts = { compact: boolean; bars: boolean; risk: boolean; time: boolean; ctx: boolean; sep: string }
+
+export type LinePart = { kind: 'dim' | 'bar' | 'pct' | 'reset' | 'ahead' | 'risk' | 'dot' | 'verdict'; text: string; tone?: 'good' | 'warn' | 'bad' }
+
+/**
+ * One window's pieces of the line, in order. The same fields whatever the
+ * verdict, a dash for what is not known yet; compact shows the forecast and
+ * the risk under pressure only.
+ *   5h 42% ↻ 2h30 → 68% risk 0% ● OK
+ */
+export function lineParts(f: Forecast, o: Pick<LineOpts, 'compact' | 'bars' | 'risk'>): LinePart[] {
+  const s = statusParts(f)
+  const parts: LinePart[] = [{ kind: 'dim', text: `${s.name} ` }]
+  if (o.bars) parts.push({ kind: 'bar', text: '' }, { kind: 'dim', text: ' ' })
+  parts.push({ kind: 'pct', text: s.pct }, { kind: 'dim', text: o.compact ? ' ↻' : ' ↻ ' }, { kind: 'reset', text: s.reset })
+  if (!o.compact || f.verdict !== 'ok') {
+    parts.push({ kind: 'dim', text: o.compact ? ' →' : ' → ' }, { kind: 'ahead', text: s.ahead, tone: s.tone })
+    if (o.risk) parts.push({ kind: 'dim', text: ' risk ' }, { kind: 'risk', text: s.risk })
+  }
+  parts.push({ kind: 'dot', text: o.compact ? ' ●' : ' ● ' }, { kind: 'verdict', text: s.verdict })
+  return parts
+}
+
+/** The line as plain text, bars stood in for by their width: what the terminal has to fit. */
+export function lineText(forecasts: Forecast[], o: LineOpts, at?: number, ctx?: string): string {
+  const windows = forecasts.map(f => lineParts(f, o).map(p => (p.kind === 'bar' ? '#'.repeat(LINE_BAR + 1) : p.text)).join('')).join(o.sep)
+  return windows + (o.time && at !== undefined ? `   · ${hhmm(at)}` : '') + (o.ctx && ctx ? `   · ${ctx}` : '')
+}
+
+/**
+ * The fullest line that fits `columns`: the bars go first, then the context,
+ * the spacing, the time and the risk. Compact never has bars, time or context.
+ */
+export function fitLine(forecasts: Forecast[], columns: number | undefined, compact: boolean, at?: number, ctx?: string): LineOpts {
+  const o: LineOpts = compact
+    ? { compact, bars: false, risk: true, time: false, ctx: false, sep: ' │ ' }
+    : { compact, bars: true, risk: true, time: at !== undefined, ctx: !!ctx, sep: '   │   ' }
+  for (const step of ['bars', 'ctx', 'sep', 'time', 'risk'] as const) {
+    if (columns === undefined || lineText(forecasts, o, at, ctx).length <= columns) break
+    if (step === 'sep') o.sep = ' │ '
+    else o[step] = false
+  }
+  return o
 }
 
 /** Local clock time, `14:02`. */

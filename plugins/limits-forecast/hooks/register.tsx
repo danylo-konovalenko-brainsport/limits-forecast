@@ -6,48 +6,61 @@ import {
   addToBuckets,
   busiestDays,
   calibrate,
+  correction,
   DAY,
   dedupeReadings,
-  dur,
   evaluate,
+  FAMILIES,
+  family,
+  FAMILY_CELL,
+  FAMILY_LABEL,
+  familyBuckets,
+  familyWeight,
+  fitLine,
   fmtPct,
-  fmtRange,
   forecast,
+  hhmm,
+  hitReadings,
   HOUR,
   isWorse,
-  LABEL,
+  labelOf,
+  LINE_BAR,
+  lineParts,
+  LOOKBACK_DAYS,
   mergeBuckets,
-  hitReadings,
   mergeHits,
   normReset,
   parseTranscript,
-  TRANSCRIPT_LINE,
   pastWeeks,
-  rangeBar,
   profile,
+  rangeBar,
   regularity,
-  SHORT,
-  hhmm,
-  statusParts,
-  statusText,
+  reweight,
+  scopedLimits,
+  scopeOf,
+  shortOf,
+  startReadings,
   suggestions,
   toLog,
+  TRANSCRIPT_LINE,
+  tune,
   usageIndex,
   VERDICT_TEXT,
   weightCheck,
-  opusWeight,
-  reweightOpus,
-  tune,
-  MIN_REPLAY,
   worst,
 } from './model'
-import type { BarPart, Buckets, Calib, Forecast, ForecastLog, Hit, Reading, Tuning, Turn, Verdict } from './model'
-import { blockedMs, buildExport, byMonth, emptyLog, forecastEntry, limitHits, logName, parseLog, projectOf, rollupTranscript } from './retro'
+import type { BarPart, Between, Buckets, Calib, Family, Forecast, ForecastLog, Hit, Limit, LinePart, Profile, Quality, Reading, Tuning, Turn, Verdict } from './model'
+import { buildExport, byMonth, emptyLog, forecastEntry, limitHits, logName, parseLog, projectOf, rollupTranscript } from './retro'
 import type { DayRow, Log, Rollup } from './retro'
+import { forecastRows, hitSummary, LEGEND, report, reportText } from './report'
+import type { Row } from './report'
 
 const PANE = 'limits'
 const view = atom({ plugin: 'limits-forecast', key: 'view' } as const, null)
 const hiddenKey = atom({ plugin: 'limits-forecast', key: 'hiddenKey' } as const, '')
+/** The live context window, shown at the end of the line: the one source of it. */
+const ctx = atom({ plugin: 'limits-forecast', key: 'ctx' } as const, null)
+const kTokens = (n: number) => (n >= 1e6 ? `${Math.round(n / 1e5) / 10}M` : `${Math.round(n / 1000)}k`)
 
 const MAX_READ = 4 * 1024 * 1024
 const FLUSH_MS = 5 * 60_000
@@ -56,11 +69,39 @@ let drawsUi = false
 const KEEP_MS = 10 * 7 * DAY
 /** Readings and forecasts of all sessions are loaded this far back. */
 const LOG_DAYS = 40
+/** The windows subscription plans have; any other window reported (but a gateway's spend limit) is shown too. */
 const KINDS = ['five_hour', 'seven_day']
 
 type FileCache = { size: number; mtimeMs: number; buckets: Buckets; hits: Hit[] }
-type HistoryCache = { version: 3; files: Record<string, FileCache> }
+/** Version 4: four cells per bucket (Fable apart), weighted at the current list prices. */
+type HistoryCache = { version: 4; files: Record<string, FileCache> }
 type LogFile = { size: number; mtimeMs: number; log: Log }
+
+/**
+ * Warning state every session shares through the plugin's store: a new
+ * session does not raise a known warning again, a hide holds everywhere, and
+ * the verdict of each window is remembered for its hysteresis.
+ */
+type Shared = { key: string; overall: Verdict; verdicts: Record<string, Verdict>; hidden: string; marks: Record<string, { r: string; m: number[] }> }
+const SHARED = 'warning'
+const emptyShared = (): Shared => ({ key: '', overall: 'ok', verdicts: {}, hidden: '', marks: {} })
+
+/**
+ * Anthropic's usage endpoint, the one /usage reads: the only place a model's
+ * own weekly window (Fable's) is reported. Asked at most every 5 minutes by
+ * whichever session saw usage, and not for half an hour after a refusal.
+ */
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+const SCOPED_MS = 5 * 60_000
+const SCOPED_BACKOFF_MS = 30 * 60_000
+/** The endpoint's last answer, shared by every session: when it was read and when the next ask may go out. */
+type Scoped = { at: number; next: number; limits: Limit[] }
+const SCOPED = 'scoped'
+
+/** The options, fixed for this activation (a change reloads the module). */
+let lineMode: 'full' | 'compact' | 'off' = 'full'
+let toasts = true
+let modelLimits = true
 
 // This process's own data; values the UI reads live in atoms.
 let base = ''
@@ -74,15 +115,14 @@ let scanAt = 0
 let scanning = false
 let scanInfo = { files: 0, skipped: 0 }
 let scanHits: Hit[] = []
-let context: number | undefined
 /** When Claude Code last reported the limits: they come with responses only. */
 let reportedAt: number | undefined
 const lastLive: Record<string, Reading> = {}
+/** Whether this session has looked at the models' own windows yet. */
+let scopedSeen = false
 const logLines: Record<string, string[]> = {}
 const dirty = new Set<string>()
-const notified = new Set<string>()
 const forecastLogged = new Set<string>()
-let prevOverall: Verdict = 'ok'
 let warned = ''
 let tipsLogged = new Set<string>()
 let timer: { cancel: () => void } | undefined
@@ -207,8 +247,8 @@ async function scan($: EngineInterface) {
       .read(cachePath)
       .then(t => JSON.parse(t) as HistoryCache)
       .catch(() => undefined)
-    const cache: HistoryCache = loaded?.version === 3 ? loaded : { version: 3, files: {} }
-    const next: HistoryCache = { version: 3, files: {} }
+    const cache: HistoryCache = loaded?.version === 4 ? loaded : { version: 4, files: {} }
+    const next: HistoryCache = { version: 4, files: {} }
     const buckets: Buckets = {}
     const hits: Hit[] = []
     const fresh: Record<string, { project: string; days: Record<string, DayRow> }> = {}
@@ -277,8 +317,8 @@ function allBuckets(): Buckets {
 
 /** Tuned settings per window: the replay is costly, so it runs at most once an hour. */
 const tuned = new Map<string, { key: string; t: Tuning }>()
-function tuningFor(kind: string, b: Buckets, now: number, horizon: number, opus: number): Tuning {
-  const key = `${Math.floor(now / HOUR)}|${Math.round(horizon / HOUR)}|${opus}`
+function tuningFor(kind: string, b: Buckets, now: number, horizon: number, w: Record<Family, number>): Tuning {
+  const key = `${Math.floor(now / HOUR)}|${Math.round(horizon / HOUR)}|${w.opus}|${w.fable}`
   const cur = tuned.get(kind)
   if (cur?.key === key) return cur.t
   const t = tune(b, kind, now, horizon)
@@ -286,30 +326,120 @@ function tuningFor(kind: string, b: Buckets, now: number, horizon: number, opus:
   return t
 }
 
+async function readShared($: EngineInterface): Promise<Shared> {
+  const v = (await $.store.get(SHARED).catch(() => undefined)) as Partial<Shared> | undefined
+  return { ...emptyShared(), ...(v ?? {}) }
+}
+
+async function writeShared($: EngineInterface, next: Shared, prev: Shared) {
+  if (JSON.stringify(next) !== JSON.stringify(prev)) await $.store.set(SHARED, next).catch(() => undefined)
+}
+
+/** The context window as last measured; redraws the line only when it moved. */
+async function setCtx($: EngineInterface, c: { tokens?: number; window?: number }) {
+  if (c.tokens === undefined || c.window === undefined) return
+  const cur = await read($, ctx)
+  if (cur && cur.tokens === c.tokens && cur.window === c.window) return
+  const tokens = c.tokens
+  const window = c.window
+  await update($, ctx, () => ({ tokens, window }))
+}
+
+/** A window's reading, kept when it moved: for this session's log and for the calibration. */
+function noteReading(now: number, kind: string, p: number, resetsAt?: string) {
+  const r = resetsAt ? normReset(resetsAt) : undefined
+  const last = lastLive[kind]
+  if (last && last.p === p && last.r === r) return
+  const reading: Reading = { t: now, kind, p, r }
+  lastLive[kind] = reading
+  own.readings.push(reading)
+  log(now, { k: 'r', w: kind, p, r })
+}
+
+/**
+ * Each model's own weekly window. Claude Code hands mods the shared windows
+ * only, so these come from the usage endpoint, with the session's own login:
+ * the engine sets the credential, the mod never sees it. One session asks for
+ * all of them, when the last answer is 5 minutes old and a response has come
+ * in since, or when it has not looked yet.
+ */
+async function scopedWindows($: EngineInterface, now: number): Promise<Limit[]> {
+  if (!modelLimits) return []
+  let cur = (await $.store.get(SCOPED).catch(() => undefined)) as Scoped | undefined
+  const moved = !scopedSeen || !cur || (reportedAt ?? 0) > cur.at
+  scopedSeen = true
+  if (moved && now >= (cur?.next ?? 0)) {
+    // Claimed before asking, so sessions measuring at the same moment do not all ask;
+    // the claim is the back-off too, should the answer not come.
+    cur = { at: cur?.at ?? 0, limits: cur?.limits ?? [], next: now + SCOPED_BACKOFF_MS }
+    await $.store.set(SCOPED, cur).catch(() => undefined)
+    try {
+      const auth = await $.session.authorize()
+      const res = auth?.kind === 'bearer' ? await $.http.fetch(USAGE_URL, { auth: auth.handle }) : undefined
+      if (res?.ok) {
+        cur = { at: now, next: now + SCOPED_MS, limits: scopedLimits(JSON.parse(res.text)) }
+        for (const l of cur.limits) noteReading(now, l.kind, l.percentUsed, l.resetsAt)
+        await $.store.set(SCOPED, cur).catch(() => undefined)
+      }
+    } catch {
+      // No login, no network, or non-essential traffic turned off: what it had stays until it resets.
+    }
+  }
+  return (cur?.limits ?? []).filter(l => !l.resetsAt || Date.parse(l.resetsAt) > now)
+}
+
 async function recompute($: EngineInterface) {
   const now = await $.clock.now()
   reportedAt ??= own.readings.reduce<number | undefined>((a, r) => Math.max(a ?? 0, r.t), undefined)
   const usage = await $.session.usage().catch(() => undefined)
-  const allLimits = usage?.rateLimits ?? []
-  const limits = allLimits.filter(l => KINDS.includes(l.kind))
-  context = usage?.context.tokens ?? context
+  if (usage) await setCtx($, usage.context)
+  const allLimits: Limit[] = [...(usage?.rateLimits ?? []), ...(await scopedWindows($, now))]
+  const limits = allLimits.filter(l => l.kind !== 'spend_limit')
+  const kinds = [...new Set([...KINDS, ...limits.map(l => l.kind)])]
+  const shared = await readShared($)
   const raw = allBuckets()
   const logs = allLogs(now)
   // Past limit hits are exact readings too: 0% at the window's start, 100% when refused.
-  const readings = dedupeReadings([...logs.readings, ...hitReadings(scanHits)])
+  const readings = dedupeReadings([...logs.readings, ...hitReadings(scanHits), ...startReadings(logs.readings)])
   const logged = logs.forecasts
-  // Once the check shows Opus clearly costs more (or less) than assumed, count it so.
-  const check = weightCheck(readings, usageIndex(raw), now)
-  const opus = opusWeight(check)
-  const buckets = reweightOpus(raw, opus)
+  // Once a family's check shows it clearly costs more (or less) than assumed, count it so.
+  const rawIndex = usageIndex(raw)
+  const recent = rawIndex(now - LOOKBACK_DAYS * DAY, now)
+  const families = FAMILIES.filter(f => recent[FAMILY_CELL[f]] > 0)
+  const checks: Partial<Record<Family, ReturnType<typeof weightCheck>>> = {}
+  for (const f of families) checks[f] = weightCheck(readings, rawIndex, now, f)
+  const weights: Record<Family, number> = { opus: familyWeight(checks.opus), fable: familyWeight(checks.fable) }
+  const buckets = reweight(raw, weights)
   const between = usageIndex(buckets)
   const prof = profile(buckets, now)
-  const cal: Record<string, Calib> = Object.fromEntries(KINDS.map(kind => [kind, calibrate(readings, between, kind, now)]))
+  // A model's own window counts that model's usage alone.
+  const scopes = new Map<string, { buckets: Buckets; between: Between; prof: Profile }>()
+  const usageOf = (kind: string) => {
+    const scope = scopeOf(kind)
+    if (scope === undefined) return { buckets, between, prof }
+    let u = scopes.get(scope)
+    if (!u) {
+      const b = familyBuckets(buckets, family(scope))
+      u = { buckets: b, between: usageIndex(b), prof: profile(b, now) }
+      scopes.set(scope, u)
+    }
+    return u
+  }
+  const cal: Record<string, Calib> = {}
+  const quality: Record<string, Quality> = {}
+  const corr: Record<string, number> = {}
+  for (const kind of kinds) {
+    cal[kind] = calibrate(readings, usageOf(kind).between, kind, now)
+    // Scored first: how far past forecasts ran off at percent level scales k.
+    quality[kind] = evaluate(logged, readings, kind, now)
+    corr[kind] = correction(quality[kind]!)
+  }
 
   const tunings: Record<string, Tuning> = {}
   const forecasts: Forecast[] = limits.map(l => {
     const resetsAt = l.resetsAt ? Date.parse(l.resetsAt) : undefined
-    const t = tuningFor(l.kind, buckets, now, resetsAt === undefined ? 0 : resetsAt - now, opus)
+    const u = usageOf(l.kind)
+    const t = tuningFor(l.kind, u.buckets, now, resetsAt === undefined ? 0 : resetsAt - now, weights)
     tunings[l.kind] = t
     return forecast({
       kind: l.kind,
@@ -318,10 +448,13 @@ async function recompute($: EngineInterface) {
       r: l.resetsAt ? normReset(l.resetsAt) : undefined,
       now,
       cal: cal[l.kind],
-      between,
+      between: u.between,
       readings,
-      prof: t.halfLife === prof.halfLife ? prof : profile(buckets, now, 8, t.halfLife),
+      prof: t.halfLife === u.prof.halfLife ? u.prof : profile(u.buckets, now, 8, t.halfLife),
       tune: t,
+      prev: shared.verdicts[l.kind],
+      correction: corr[l.kind],
+      share: l.share,
     })
   })
 
@@ -339,14 +472,22 @@ async function recompute($: EngineInterface) {
   const overall = worst(forecasts.map(f => f.verdict))
   const worstOne = forecasts.find(f => f.verdict === overall)
   const warningKey = `${overall}:${worstOne?.kind ?? ''}`
-  const tips = suggestions({ forecasts, between, now, context })
+  const tips = suggestions({ forecasts, between, now, context: (await read($, ctx))?.tokens })
+  const next: Shared = {
+    ...shared,
+    key: overall === 'ok' ? '' : warningKey,
+    overall,
+    verdicts: Object.fromEntries(forecasts.map(f => [f.kind, f.verdict])),
+    marks: {},
+  }
   if (overall === 'ok') warned = ''
   else {
     if (warned !== warningKey) {
       warned = warningKey
       tipsLogged = new Set()
-      log(now, { k: 'e', e: 'warn', v: overall, w: worstOne?.kind })
     }
+    // The first session to see a warning logs it; each session logs the tips it shows.
+    if (shared.key !== warningKey) log(now, { k: 'e', e: 'warn', v: overall, w: worstOne?.kind })
     for (const tip of tips.slice(0, 2)) {
       if (tipsLogged.has(tip.id)) continue
       tipsLogged.add(tip.id)
@@ -357,7 +498,7 @@ async function recompute($: EngineInterface) {
   const week = limits.find(l => l.kind === 'seven_day')
   const kWeek = cal.seven_day?.k
   const reg = regularity(between, now, prof.since)
-  const next: View = {
+  const nextView: View = {
     updatedAt: now,
     ...(reportedAt !== undefined ? { reportedAt } : {}),
     overall,
@@ -365,12 +506,12 @@ async function recompute($: EngineInterface) {
     forecasts,
     tips,
     learned: {
-      calib: KINDS.map(kind => ({ label: LABEL[kind] ?? kind, ...cal[kind]!, kind })),
-      ...(check ? { opusCheck: { ...check, applied: opus !== 1 } } : {}),
-      tuning: KINDS.filter(kind => tunings[kind]).map(kind => ({ kind, label: LABEL[kind] ?? kind, ...tunings[kind]! })),
+      calib: kinds.map(kind => ({ label: labelOf(kind), ...cal[kind]!, kind })),
+      weights: families.map(f => ({ family: f, label: FAMILY_LABEL[f], ...(checks[f] ? { ...checks[f]!, applied: weights[f] !== 1 } : {}) })),
+      tuning: kinds.filter(kind => tunings[kind]).map(kind => ({ kind, label: labelOf(kind), ...tunings[kind]! })),
       ...(reg ? { regularity: reg } : {}),
     },
-    quality: KINDS.map(kind => ({ label: LABEL[kind] ?? kind, ...evaluate(logged, readings, kind, now) })),
+    quality: kinds.map(kind => ({ label: labelOf(kind), ...quality[kind]!, correction: corr[kind]! })),
     history: {
       scanning,
       days: Math.floor(prof.days),
@@ -382,21 +523,25 @@ async function recompute($: EngineInterface) {
     },
     folder,
   }
-  await update($, view, () => next)
+  await update($, view, () => nextView)
+  // A hide in any session holds in all of them.
+  if ((await read($, hiddenKey)) !== shared.hidden) await update($, hiddenKey, () => shared.hidden)
 
-
-  // Speak up only when things get worse, or a threshold is crossed.
-  if (isWorse(overall, prevOverall) && worstOne) $.ui.toast(worstOne.headline, { timeoutMs: 8000 })
-  prevOverall = overall
+  // Speak up only when things get worse, or a threshold is crossed, and once across sessions.
+  if (toasts && isWorse(overall, shared.overall) && worstOne) $.ui.toast(worstOne.headline, { timeoutMs: 8000 })
   for (const l of allLimits) {
+    const r = l.resetsAt ?? ''
+    const was = shared.marks[l.kind]
+    const m = { r, m: was && was.r === r ? [...was.m] : [] }
     for (const mark of [80, 90]) {
-      const key = `${l.kind}:${l.resetsAt}:${mark}`
-      if (l.percentUsed >= mark && !notified.has(key)) {
-        notified.add(key)
-        $.ui.toast(`${SHORT[l.kind] ?? l.kind} limit at ${fmtPct(l.percentUsed)}`)
+      if (l.percentUsed >= mark && !m.m.includes(mark)) {
+        m.m.push(mark)
+        if (toasts) $.ui.toast(`${shortOf(l.kind)} limit at ${fmtPct(l.percentUsed)}`)
       }
     }
+    next.marks[l.kind] = m
   }
+  await writeShared($, next, shared)
 }
 
 /** Writes the export folder from every log and rollup there is. */
@@ -434,8 +579,10 @@ async function exportAll($: EngineInterface): Promise<string> {
 const verdictColor = (verdict: Verdict) => (verdict === 'ok' ? 'success' : verdict === 'slow' ? 'warning' : 'error')
 const TONE = { good: 'success', warn: 'warning', bad: 'error' } as const
 
+type TextStyle = { color?: string; dimColor?: boolean; bold?: boolean }
+
 /** How each part of a bar is drawn, in the window's verdict color. */
-const barTint = (verdict: Verdict): Record<BarPart['kind'], { color?: string; dimColor?: boolean; bold?: boolean }> => ({
+const barTint = (verdict: Verdict): Record<BarPart['kind'], TextStyle> => ({
   used: { color: verdictColor(verdict) },
   likely: { color: verdictColor(verdict), dimColor: true },
   range: { color: 'subtle' },
@@ -443,17 +590,35 @@ const barTint = (verdict: Verdict): Record<BarPart['kind'], { color?: string; di
   limit: { bold: true },
 })
 
-/** Cells of the small bar in the limits line, left out when the line would not fit. */
-const LINE_BAR = 10
+/** How each piece of the limits line is drawn: the forecast in its tone, the verdict in its color. */
+function lineStyle(p: LinePart, verdict: Verdict): TextStyle {
+  switch (p.kind) {
+    case 'dim':
+      return { dimColor: true }
+    case 'pct':
+      return { bold: true }
+    case 'ahead':
+      return p.tone ? { color: TONE[p.tone], bold: p.tone !== 'good' } : { dimColor: true }
+    case 'risk':
+      return { dimColor: p.text === '–' }
+    case 'dot':
+      return { color: verdictColor(verdict) }
+    case 'verdict':
+      return { color: verdictColor(verdict), bold: true }
+    default:
+      return {}
+  }
+}
 
 const openPane = ($: EngineInterface) => $.ui.open({ id: PANE, title: 'Usage limits' })
 
-const pct1 = (x: number) => `${Math.round(x * 100)}%`
-const num = (x: number, d = 1) => x.toFixed(d)
+export const register: Register = (on, options) => {
+  lineMode = options.line === 'compact' ? 'compact' : options.line === 'off' ? 'off' : 'full'
+  toasts = options.toasts !== false
+  modelLimits = options.modelLimits !== false
 
-export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'limits-forecast', description: 'Usage limits: forecast, history and suggestions ("/limits-forecast text" prints it, "/limits-forecast export" writes CSVs)' })
+    await $.command.register({ name: 'limits-forecast', description: 'Usage limits: forecast, history and suggestions', argumentHint: 'text | export' })
     await init($)
     // The limits line is drawn in the band above the prompt now.
     $.ui.status(undefined)
@@ -483,7 +648,8 @@ export const register: Register = on => {
     const sub = e.agentId !== undefined
     const entry: Record<string, unknown> = { k: 't', d: e.durationMs, s: sub ? 1 : 0 }
     if (e.isAborted) entry.a = 1
-    if (!sub && context !== undefined) entry.x = context
+    const c = sub ? null : await read($, ctx)
+    if (c) entry.x = c.tokens
     if (u) {
       const turn: Turn = {
         t: now,
@@ -502,7 +668,7 @@ export const register: Register = on => {
   })
 
   on('session.compact', async ($, e, next) => {
-    const before = context
+    const before = (await read($, ctx))?.tokens
     const result = await next(e)
     log(await $.clock.now(), { k: 'e', e: 'compact', ...(before !== undefined ? { x: before } : {}) })
     return result
@@ -510,17 +676,9 @@ export const register: Register = on => {
 
   on('session.measure', async ($, e, next) => {
     const now = await $.clock.now()
-    if (e.context.tokens !== undefined) context = e.context.tokens
+    if (e.changed.includes('context')) await setCtx($, e.context)
     if (e.rateLimits.length) reportedAt = now
-    for (const l of e.rateLimits) {
-      const r = l.resetsAt ? normReset(l.resetsAt) : undefined
-      const reading: Reading = { t: now, kind: l.kind, p: l.percentUsed, r }
-      const last = lastLive[l.kind]
-      if (last && last.p === reading.p && last.r === reading.r) continue
-      lastLive[l.kind] = reading
-      own.readings.push(reading)
-      log(now, { k: 'r', w: l.kind, p: l.percentUsed, r })
-    }
+    for (const l of e.rateLimits) noteReading(now, l.kind, l.percentUsed, l.resetsAt)
     if (e.changed.includes('rateLimits')) await recompute($)
     else if (e.rateLimits.length) {
       // Same percent, fresh report: only the time moves.
@@ -549,37 +707,29 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     drawsUi = true
+    if (lineMode === 'off' || e.props.hasSurvey) return next(e)
     const v = await read($, view)
-    if (e.props.hasSurvey || !v || v.forecasts.length === 0) return next(e)
+    const c = await read($, ctx)
     const { Box, Button, Text } = $.ui.resolve(e)
-    // Always one line, each verdict in its own color; the warning only under pressure.
-    // The small bars go when the line would not fit.
-    const plain = statusText(v.forecasts, v.reportedAt) ?? ''
-    const bars = plain.length + v.forecasts.length * (LINE_BAR + 2) <= e.props.bodyColumns
+    const ctxText = c && c.window > 0 ? `ctx ${kTokens(c.tokens)}/${kTokens(c.window)} ${Math.round((c.tokens / c.window) * 100)}%` : undefined
+    if (!v || v.forecasts.length === 0) return ctxText && lineMode === 'full' ? <Text dimColor>{ctxText}</Text> : next(e)
+    // One line, each verdict in its own color, the warning only under pressure.
+    // What does not fit the terminal goes, the small bars first.
+    const o = fitLine(v.forecasts, e.props.bodyColumns, lineMode === 'compact', v.reportedAt, ctxText)
     const line = (
       <Box flexDirection="row">
-        {v.forecasts.map((f, i) => {
-          const s = statusParts(f)
-          return (
-            <Box flexDirection="row" flexShrink={0}>
-              {i > 0 && <Text dimColor>{'   │   '}</Text>}
-              <Text dimColor>{`${s.name} `}</Text>
-              {bars && rangeBar(f, LINE_BAR).map(part => <Text {...barTint(f.verdict)[part.kind]}>{part.text}</Text>)}
-              {bars && <Text> </Text>}
-              <Text bold>{s.pct}</Text>
-              <Text dimColor>{' ↻ '}</Text>
-              <Text>{s.reset}</Text>
-              <Text dimColor>{' → '}</Text>
-              <Text bold={s.tone !== undefined && s.tone !== 'good'} {...(s.tone ? { color: TONE[s.tone] } : { dimColor: true })}>{s.ahead}</Text>
-              {s.range && <Text dimColor>{` (${s.range})`}</Text>}
-              <Text dimColor>{' risk '}</Text>
-              <Text dimColor={s.risk === '–'}>{s.risk}</Text>
-              <Text color={verdictColor(f.verdict)}>{' ● '}</Text>
-              <Text bold color={verdictColor(f.verdict)}>{s.verdict}</Text>
-            </Box>
-          )
-        })}
-        {v.reportedAt !== undefined && <Text dimColor>{`   · ${hhmm(v.reportedAt)}`}</Text>}
+        {v.forecasts.map((f, i) => (
+          <Box flexDirection="row" flexShrink={0}>
+            {i > 0 && <Text dimColor>{o.sep}</Text>}
+            {lineParts(f, o).flatMap(p =>
+              p.kind === 'bar'
+                ? rangeBar(f, LINE_BAR).map(part => <Text {...barTint(f.verdict)[part.kind]}>{part.text}</Text>)
+                : [<Text {...lineStyle(p, f.verdict)}>{p.text}</Text>],
+            )}
+          </Box>
+        ))}
+        {o.time && v.reportedAt !== undefined && <Text dimColor>{`   · ${hhmm(v.reportedAt)}`}</Text>}
+        {o.ctx && ctxText && <Text dimColor>{`   · ${ctxText}`}</Text>}
       </Box>
     )
     if (v.overall === 'ok' || (await read($, hiddenKey)) === v.warningKey) return line
@@ -603,6 +753,8 @@ export const register: Register = on => {
             onPress={async () => {
               log(await $.clock.now(), { k: 'e', e: 'hide', key: v.warningKey })
               await update($, hiddenKey, () => v.warningKey)
+              const s = await readShared($)
+              await writeShared($, { ...s, hidden: v.warningKey }, s)
             }}
           />
         </Box>
@@ -673,174 +825,4 @@ export const register: Register = on => {
       </Box>
     )
   })
-}
-
-type Row = { label: string; value: string; dim?: boolean }
-
-const LEGEND = '█ used   ▓ forecast by the reset   ▒ 80% range above it   │ the limit (100%)'
-
-/** One limit's rows, as the pane and the text report show them. */
-function forecastRows(f: View['forecasts'][number], v: View): Row[] {
-  const week = f.kind === 'seven_day'
-  const rows: Row[] = [
-    { label: 'used', value: `${fmtPct(f.p)} now` },
-    {
-      label: 'resets',
-      value: f.msToReset !== undefined ? `in ${dur(f.msToReset)} · ${clockTime(v.updatedAt + f.msToReset, week)}` : '–',
-      dim: f.msToReset === undefined,
-    },
-    {
-      label: 'at reset',
-      value:
-        f.projected === undefined
-          ? '– learning how your tokens map to percent'
-          : `~${fmtPct(f.projected)}` +
-            (f.lo !== undefined && f.hi !== undefined
-              ? `  ·  80% range ${fmtRange(f.lo, f.hi)}  (from ${f.samples} past ${f.sampleUnit})`
-              : `  ·  range needs 3 comparable past ${week ? 'weeks' : 'days'}`),
-      dim: f.projected === undefined,
-    },
-    { label: 'risk', value: f.risk !== undefined ? `${pct1(f.risk)} chance to run out before the reset` : '– comes with the range', dim: f.risk === undefined },
-    { label: 'speed', value: f.rate !== undefined ? `${f.rate.toFixed(1)}%/h over ${f.rateBasis}` : `– ${f.rateBasis}`, dim: f.rate === undefined },
-    {
-      label: 'even pace',
-      value: f.pace !== undefined ? `${fmtPct(f.pace)} by now · you are ${f.p <= f.pace ? 'under' : 'over'} by ${Math.round(Math.abs(f.p - f.pace))}` : '–',
-      dim: f.pace === undefined,
-    },
-  ]
-  if (week) rows.push({ label: 'per day', value: f.perDayLeft !== undefined ? `~${fmtPct(f.perDayLeft)} a day left until the reset` : '–', dim: f.perDayLeft === undefined })
-  return rows
-}
-
-/** The pane's text below the limits: the same for the pane and for `/limits-forecast` where no pane shows. */
-function report(v: View) {
-  const hist = v.history
-  const c = (x: View['learned']['calib'][number]): Row => ({
-    label: x.label,
-    value:
-      (x.k === undefined
-        ? `learning tokens → %: ${String(Math.round(Math.min(x.points, 3) * 10) / 10)} of 3 points seen`
-        : x.seAssumed
-          ? `tokens → % learned, ±${pct1((x.se ?? 0) / x.k)} assumed until 3 stretches (${x.n} so far)`
-          : `tokens → % learned, ±${pct1((x.se ?? 0) / x.k)} (${x.n} stretches)`) +
-      (x.changedAt !== undefined ? ` · re-learned after a change on ${clockTime(x.changedAt, true)}` : ''),
-    dim: x.k === undefined,
-  })
-  return {
-    note:
-      v.forecasts.length > 0
-        ? `As of ${v.reportedAt !== undefined ? clockTime(v.reportedAt, false) : '–'} · updates with every response`
-        : 'No limit reading yet: it arrives with the next response (subscription plans only).',
-    sections: [
-      {
-        title: 'Learning',
-        rows: [
-          ...v.learned.calib.map(c),
-          { label: 'Opus cost', value: opusText(v.learned.opusCheck), dim: !v.learned.opusCheck },
-          ...v.learned.tuning.map(t => ({ label: `${t.label} fit`, value: tuningText(t), dim: t.independent < MIN_REPLAY })),
-          {
-            label: 'your weeks',
-            value: v.learned.regularity
-              ? `vary by ±${pct1(v.learned.regularity.cv)} from week to week (${v.learned.regularity.weeks} weeks)`
-              : '– needs 2 full weeks',
-            dim: !v.learned.regularity,
-          },
-        ],
-      },
-      { title: 'Forecast quality · last 4 weeks', rows: v.quality.map(q => ({ label: q.label, value: qualityText(q), dim: q.n < 3 })) },
-      {
-        title: 'History',
-        rows: [
-          {
-            label: 'read',
-            value: hist.scanning
-              ? 'reading past sessions…'
-              : `${hist.days} days from ${hist.files} transcripts${hist.skipped ? ` (${hist.skipped} could not be read)` : ''}`,
-          },
-          { label: 'limit hits', value: hist.hits.count ? hitText(hist.hits) : '– none in your history', dim: !hist.hits.count },
-          { label: 'busiest', value: hist.busiest.length ? hist.busiest.join(', ') : '– needs a week', dim: !hist.busiest.length },
-          {
-            label: 'past weeks',
-            value: hist.pastWeeks.length ? `${hist.pastWeeks.map(p => fmtPct(p)).join(' · ')}  (latest first, estimated)` : '–',
-            dim: !hist.pastWeeks.length,
-          },
-        ],
-      },
-    ] as { title: string; rows: Row[] }[],
-    footer: `Data: ${v.folder}  ·  /limits-forecast export writes CSVs for a retrospective`,
-  }
-}
-
-/** The pane as plain text, for surfaces that draw no plugin panes (VS Code). */
-function reportText(v: View | null): string {
-  if (!v) return 'Usage limits: collecting data…'
-  const rep = report(v)
-  const line = (r: Row) => `  ${r.label.padEnd(12)}${r.value}`
-  const out = [rep.note, '']
-  for (const f of v.forecasts) {
-    out.push(`${f.label.padEnd(14)}${VERDICT_TEXT[f.verdict]}`, ' '.repeat(14) + rangeBar(f).map(p => p.text).join(''), ...forecastRows(f, v).map(line), '')
-  }
-  if (v.forecasts.length) out.push(LEGEND, '')
-  out.push('Suggestions', ...(v.tips.length ? v.tips.map(t => `  • ${t.text}`) : ['  – nothing to change right now']), '')
-  for (const sec of rep.sections) out.push(sec.title, ...sec.rows.map(line), '')
-  out.push(rep.footer)
-  return out.join('\n')
-}
-
-const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
-function clockTime(t: number, withDay: boolean) {
-  const d = new Date(t)
-  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-  return withDay ? `${DAYS[d.getDay()]} ${hm}` : hm
-}
-
-function opusText(c: View['learned']['opusCheck']): string {
-  if (!c) return '– needs more mixed Opus and other use to check'
-  const x = `×${num(c.ratio, 2)} ± ${num(c.se, 2)}`
-  if (Math.abs(c.ratio - 1) <= 2 * c.se) return `weighted as assumed (${x})`
-  return `${c.ratio > 1 ? 'costs more' : 'costs less'} of your limit than assumed (${x})${c.applied ? ', now counted so' : ', not yet precise enough to apply'}`
-}
-
-/** What the replay of past weeks learned, in plain words. */
-function tuningText(t: View['learned']['tuning'][number]): string {
-  if (t.independent < MIN_REPLAY) return `– tunes itself from ${MIN_REPLAY} non-overlapping replayed forecasts (${t.independent} so far)`
-  const parts = [`bursts fade over ${dur(t.tau)}`, `recent ${Math.round(t.halfLife / DAY)} days count half`]
-  if (t.gain !== undefined && t.gain > 0) parts.push(`${pct1(t.gain)} more accurate than the defaults`)
-  if (t.bias !== 1) parts.push(`forecasts ×${num(t.bias, 2)} (they ran ${t.bias < 1 ? 'high' : 'low'})`)
-  if (t.coverage !== undefined) {
-    parts.push(
-      t.scale === 1
-        ? `range held ${pct1(t.coverage)} (aim 80%)`
-        : `range ×${num(t.scale, 2)} so it held ${pct1(t.coverage)} instead of ${pct1(t.coverage0 ?? 0)} (aim 80%)`,
-    )
-  }
-  return `${parts.join(' · ')}  (${t.n} replayed, ~${t.independent} independent)`
-}
-
-function qualityText(q: View['quality'][number]): string {
-  if (q.n < 3) return `– ${q.n} forecasts checked so far, scores after 3 resets`
-  const parts = [`off by ±${num(q.mae ?? 0)} pts`]
-  if (q.bias !== undefined && Math.abs(q.bias) >= 3) parts.push(`tends to run ${q.bias > 0 ? 'high' : 'low'}`)
-  if (q.coverage !== undefined) parts.push(`range held ${pct1(q.coverage)} (aim 80%)`)
-  if (q.skill !== undefined) parts.push(`${pct1(Math.abs(q.skill))} ${q.skill >= 0 ? 'better' : 'worse'} than "speed stays the same"`)
-  if (q.brier !== undefined) parts.push(`risk score ${num(q.brier, 2)} (0 best, 0.25 coin toss)`)
-  parts.push(`${q.n} checked`)
-  return parts.join(' · ')
-}
-
-function hitSummary(hits: Hit[]): View['history']['hits'] {
-  const n = (kind: string) => hits.filter(h => h.kind === kind).length
-  return {
-    count: hits.length,
-    fiveHour: n('five_hour'),
-    weekly: n('seven_day'),
-    blockedHours: hits.reduce((a, h) => a + blockedMs(h), 0) / HOUR,
-    ...(hits.length ? { last: hits[hits.length - 1]!.t } : {}),
-  }
-}
-
-function hitText(h: View['history']['hits']): string {
-  const kinds = [h.fiveHour ? `${h.fiveHour}× 5-hour` : '', h.weekly ? `${h.weekly}× weekly` : ''].filter(Boolean).join(', ')
-  const last = h.last !== undefined ? ` · last ${clockTime(h.last, true)} ${new Date(h.last).getDate()}.${new Date(h.last).getMonth() + 1}.` : ''
-  return `${kinds} · ${num(h.blockedHours)} h blocked${last}`
 }

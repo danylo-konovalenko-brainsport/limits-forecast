@@ -1,6 +1,6 @@
 # limits-forecast
 
-A Claude Code mod that forecasts your 5‑hour and weekly usage limits, learns your usage pattern and suggests what to change before you run out.
+A Claude Code mod that forecasts your 5‑hour and weekly usage limits, and a model's own weekly limit where your plan has one (Fable's), learns your usage pattern and suggests what to change before you run out.
 
 ![Claude Code mod](https://img.shields.io/badge/Claude_Code-mod-D97757)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
@@ -12,28 +12,33 @@ A Claude Code mod that forecasts your 5‑hour and weekly usage limits, learns y
 ### Limits line above the prompt
 
 ```
-5h ███▓▓▒··│·· 42% ↻ 2h30 → 68% (61–77) risk 0% ● OK   │   wk █████▓▓▓│▒▒ 61% ↻ 3d → 104% (88–119) risk 75% ● SLOW DOWN   · 14:02
+5h ███▓▓▒··│·· 42% ↻ 2h30 → 68% risk 0% ● OK   │   wk █████▓▓▓│▒▒ 61% ↻ 3d → 104% risk 75% ● SLOW DOWN   · 14:02   · ctx 84k/200k 42%
 ```
 
 | Field | Meaning |
 | --- | --- |
 | `· 14:02` | When Claude Code last reported your limits. Claude Code gets them with each response, so they update when you send a message; usage in other sessions or on claude.ai shows up after your next one. |
+| `· ctx 84k/200k 42%` | The current context: tokens the last response was answered over, out of the model's window. It shows even before the mod has a forecast. |
 | `5h` / `wk` | The 5-hour window and the weekly window. |
-| `███▓▓▒··│··` | A small version of the [pane's bar](#limits-pane), 0–125% in 10 cells. Left out when the terminal is too narrow for the line. |
+| `fable` | A model's own weekly window, after the two, where your plan has one: what `/usage` shows as *Current week (Fable)*. It has the same fields and its own forecast, see [Model limits](#model-limits). |
+| `███▓▓▒··│··` | A small version of the [pane's bar](#limits-pane), 0–125% in 10 cells. The first thing to go when the terminal is too narrow for the line. |
 | `42%` | Used now, exactly as Claude Code reports it. |
 | `↻ 2h30` | Time until the window resets (`1d 23h` beyond a day). |
-| `→ 68%` | **Point forecast**: the expected percent at reset. |
-| `(61–77)` | **80% prediction interval**: the final value lands in this range about 8 times out of 10. |
+| `→ 68%` | **Point forecast**: the expected percent at reset. The 80% range behind it is in the pane. |
 | `risk 0%` | **Probability** of reaching 100% before the reset. |
 | `OK` / `SLOW DOWN` / `HOLD ON` | The verdict (rules [below](#verdicts)). |
 
-The fields are the same whatever the verdict. A `–` means *not known yet*, for example before the mod has learned enough. Colors:
+The fields are the same whatever the verdict. A `–` means *not known yet*, for example before the mod has learned enough. When the line is wider than the terminal it sheds, in this order: the bars, the context, the spacing, the time, the risk.
+
+`/config` has three options for the mod. **Limits line** is `full`, `compact` or `off`: compact drops the bars, the time and the context, and shows the forecast and risk only while a window is not OK, `5h 42% ↻2h30 ●OK │ wk 61% ↻3d →104% risk 75% ●SLOW DOWN`. **Toasts** turns the toasts off. **Model limits** turns the models' own windows off, and with them the mod's only network call.
+
+Colors:
 
 - **Verdict:** OK green, SLOW DOWN yellow, HOLD ON red.
 - **Forecast:** green, yellow when it is at 90% or more or its range reaches past 100%, red when it is over 100%. So a tight window stands out even while the verdict is OK.
 - **Bar:** the used part in the verdict color, the rest dim.
 
-When a window is under pressure, the warning headline, the top suggestions and two buttons appear under the line: **Hide** keeps the warning away until the situation changes (the line stays); **Details** opens the pane.
+When a window is under pressure, the warning headline, the top suggestions and two buttons appear under the line: **Hide** keeps the warning away until the situation changes, in every session (the line stays); **Details** opens the pane.
 
 ### `/limits-forecast` pane
 
@@ -49,9 +54,27 @@ When a window is under pressure, the warning headline, the top suggestions and t
 
 - **The bar** runs from 0 to 125% in 5% cells. `█` is used, `▓` runs up to the forecast at the reset, `▒` from there to the top of the 80% range, and `│` marks the limit at 100%. It's a fan chart in one row: it draws the side of the range that decides whether you hit the limit, and the numbers next to it give the whole range.
 - **Suggestions** (see [below](#suggestions)).
-- **Learning:** how many tokens make one percent and its standard error (or the assumed one, and whether it re-learned after a change), the Opus weight check and whether it's applied, what the replay tuned per window, and how regular your weeks are. Each row says what data it is still waiting for.
-- **Forecast quality:** the [scores](#how-it-scores-itself) in plain words.
+- **Learning:** how many tokens make one percent and its standard error (or the assumed one, and whether it re-learned after a change), the weight check of each model family you use (Opus, Fable) and whether it's applied, what the replay tuned per window, and how regular your weeks are. Each row says what data it is still waiting for.
+- **Forecast quality:** the [scores](#how-it-scores-itself) in plain words, and the [correction](#10-scored-correction) they led to.
 - **History:** transcripts read, your past limit hits and hours blocked, your busiest days, and your past weeks in percent.
+
+#### Model limits
+
+Some plans give a model a weekly limit of its own on top of the shared one: `/usage` shows it as *Current week (Fable)*. The mod shows it as a third window, in the line and in the pane:
+
+```
+Fable         OK
+  used          49% now
+  resets        in 2d · Fri 14:00
+  at reset      ~81%  ·  80% range 66–97%  (from 4 past weeks)
+  ...
+  per day       ~26% a day left until the reset
+  of the week   Fable may take 50% of the weekly limit and has taken 25%
+```
+
+It is forecast like the week, with one difference: only that model's usage counts, so its tokens → % conversion, its profile and its replay are learned from that model's usage alone. It has a forecast from its first read: the window began at 0% a week before its reset, and the model's usage since then is in your transcripts. The last row is what Anthropic reports about the limit itself: how much of the shared weekly limit the model may take in total, and how much it has taken.
+
+Claude Code reports this window to `/usage` only, not to mods, so the mod reads it where `/usage` does, see [Model calls and network](#model-calls-and-network). It is as fresh as the last read: at most 5 minutes old after a response, older while you are idle.
 
 The VS Code extension draws no plugin panes or bands, so there `/limits-forecast` prints the same report as text. It goes by whether anything of the mod has been drawn yet. `/limits-forecast text` asks for the text version anywhere.
 
@@ -61,7 +84,7 @@ This writes 13 CSV tables and a `summary.json` for retrospectives. The files are
 
 ### Toasts
 
-You get a toast when the verdict gets worse, and when a window crosses 80% and 90%.
+You get a toast when the verdict gets worse, and when a window crosses 80% and 90%: once, in the first session that sees it, not again in every session you open. The **Toasts** option in `/config` turns them off.
 
 ---
 
@@ -89,7 +112,7 @@ To try it without installing:
 claude --plugin-dir ./plugins/limits-forecast
 ```
 
-> **Requirements:** a Claude Code build with mod support (developed on 2.1.292) and a subscription plan. Only subscription plans report rate-limit windows.
+> **Requirements:** a Claude Code build with mod support (developed on 2.1.292, tested on 2.1.327) and a subscription plan. Only subscription plans report rate-limit windows.
 
 ---
 
@@ -98,7 +121,9 @@ claude --plugin-dir ./plugins/limits-forecast
 | Question | Answer |
 | --- | --- |
 | Does it call Claude or any other model? | **No.** The code never touches `$.model`. |
-| Does it send data anywhere? | **No.** There are no HTTP calls. It reads local files and writes to `~/.claude/limit-metrics/`. |
+| Does it send data anywhere? | **No.** It reads local files and writes to `~/.claude/limit-metrics/`. |
+| Does it make network calls? | **One**, for the [model limits](#model-limits): a `GET` to `https://api.anthropic.com/api/oauth/usage`, the endpoint `/usage` reads, with no body. It goes out at most every 5 minutes, only after a response has come in since the last one, from one session for all of them, and not for 30 minutes after a failure. The **Model limits** option turns it off. |
+| Does it see your login? | **No.** The call is signed by Claude Code: the mod gets an opaque handle from `$.session.authorize()`, and the engine attaches the credential itself, for Anthropic's own hosts only. With `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` set, Claude Code refuses the call. |
 | Does it use your limit? | **No.** It costs nothing from the limits it watches. |
 | How does it learn? | By fitting a few numbers to your history with the formulas under [The math](#the-math). |
 
@@ -123,13 +148,13 @@ flowchart LR
     R --> S
 ```
 
-1. **Readings.** After each response Claude Code reports every limit window (`five_hour`, `seven_day`) with the percent used and the reset time. The mod logs each move of a window.
+1. **Readings.** After each response Claude Code reports every limit window (`five_hour`, `seven_day`; any other window it reports is shown too) with the percent used and the reset time. The mod logs each move of a window. A model's own weekly window (`seven_day_fable`) is read from Anthropic's usage endpoint instead and logged the same way.
 2. **Usage.** Every 5 minutes (and 1 second after start) the mod reads all sessions' transcripts in `~/.claude/projects` and sums the tokens per 15-minute bucket, converted to [units](#1-units-tokens--dollars). Unchanged files come from a cache. Files over the runtime's 4 MiB read limit are streamed through `cat` (`type` on Windows), keeping only the lines the parser needs.
 3. **Past hits.** When you ran out, Claude Code wrote the refused request into the transcript with `error: "rate_limit"` and `quotaLimits { rateLimitType, resetsAt }`. Each hit becomes two exact readings: 0% when the window started and 100% at the hit. So if you've ever hit a limit, calibration works from day one.
-4. **Calibration** learns how many percent one unit costs, separately for each window.
+4. **Calibration** learns how many percent one unit costs, separately for each window, and checks the assumed weight of each model family you use. A model's own window is matched against that model's usage alone, and so are its profile, forecast and replay.
 5. **Profile** learns when you usually work: weekday totals times an hour-of-day shape.
 6. **Forecast** combines your usual pattern, today's deviation from it and the spread of your past weeks.
-7. **Self-scoring** compares every logged forecast with the final percent once its window resets.
+7. **Self-scoring** compares every logged forecast with the final percent once its window resets, and scales the conversion by how far they ran off.
 8. **Self-tuning** replays past weeks to learn the settings the forecast uses: how fast bursts fade, how much recent weeks count, any bias, and how wide the range must be to hold 80%.
 
 ---
@@ -138,16 +163,29 @@ flowchart LR
 
 ### 1. Units: tokens → dollars
 
-Different tokens cost the limit different amounts. Tokens are weighted by the ratios of Anthropic's published API list prices ([pricing](https://platform.claude.com/docs/en/about-claude/pricing)):
+Different tokens cost the limit different amounts. Tokens are weighted by Anthropic's published API list prices ([pricing](https://platform.claude.com/docs/en/about-claude/pricing), October 2026):
 
 ```math
-u \;=\; f_{\text{model}}\cdot\frac{\text{in} + 1.25\,\text{cache\_write} + 0.1\,\text{cache\_read} + 5\,\text{out}}{10^6},
-\qquad f_{\text{Opus}}=5,\; f_{\text{Sonnet}}=3,\; f_{\text{Haiku}}=1
+u \;=\; P_{\text{in}}\cdot\frac{\text{in} + 1.25\,\text{cw}_{5\text{m}} + 2\,\text{cw}_{1\text{h}} + r\,\text{cache\_read} + 5\,\text{out}}{10^6}
 ```
 
-One unit is about one US dollar at API list prices. It isn't what your subscription costs.
+| Model | $P_{\text{in}}$, $ per MTok | $r$, cache read ÷ input |
+| --- | --- | --- |
+| Fable 5.1, Fable 5, Mythos | 10 | 0.025 |
+| Opus 5.5 | 4 | 0.05 |
+| Opus 5, Opus 4.5 to 4.8 | 5 | 0.1 |
+| Opus 4, Opus 4.1 | 15 | 0.1 |
+| Sonnet 5, Sonnet 5.5 | 2 | 0.1 |
+| Sonnet 4.x | 3 | 0.1 |
+| Haiku 5.5 | 0.10 | 0.1 |
+| Haiku 4.5 | 1 | 0.1 |
+| anything else | 2 | 0.1 |
 
-Each message is counted once per message id, because Claude Code writes every content block of a message as its own line with the same usage. Usage is summed into 15-minute buckets with a prefix-sum index, so the usage between any two moments is an O(log n) lookup. The two edge buckets are prorated. *(`units`, `usageIndex` in `model.ts`)*
+Output costs 5× the input everywhere. Cache writes cost 1.25× the input for the 5-minute cache and 2× for the 1-hour one; Claude Code uses the 1-hour cache, and each transcript line says which was used. Cache reads are most of a long session's tokens, so their share of the input price matters most, and it differs per model now.
+
+One unit is about one US dollar at API list prices. It isn't what your subscription costs, and whether the limit charges Fable like the API does is what the [weight check](#3-model-weight-check-two-variable-wls--delta-method) measures.
+
+Each message is counted once per message id, because Claude Code writes every content block of a message as its own line with the same usage. Usage is summed into 15-minute buckets (all, subagents, Opus, Fable) with a prefix-sum index, so the usage between any two moments is an O(log n) lookup. The two edge buckets are prorated. *(`price`, `units`, `usageIndex` in `model.ts`)*
 
 ### 2. Calibration: percent per unit (ratio estimator)
 
@@ -187,18 +225,18 @@ the mod learns from those two alone. The last term allows for small stretches be
 
 *(`calibrate`, `ratioFit`)*
 
-### 3. Opus weight check (two-variable WLS + delta method)
+### 3. Model weight check (two-variable WLS + delta method)
 
-Is Opus really 5/3 as expensive as Sonnet *against the limit*? Using the same stretches, the mod fits Opus and non-Opus usage separately, again through the origin with weights $w_i / (x_{1i}+x_{2i})$:
+Is Fable really 2.5× as expensive as Opus 5.5 *against the limit*, and Opus 2× Sonnet? For each family you use (Opus, Fable), using the same stretches, the mod fits that family's usage and all other usage separately, again through the origin with weights $w_i / (x_{1i}+x_{2i})$:
 
 ```math
-y_i = a\,x_{\text{opus},i} + b\,x_{\text{other},i} + \varepsilon_i
+y_i = a\,x_{\text{family},i} + b\,x_{\text{other},i} + \varepsilon_i
 ```
 
 and reports $a/b$:
 
 - 1.0 means the assumed weight is right.
-- 1.3 means Opus costs 30% more of the limit than assumed.
+- 1.3 means the family costs 30% more of the limit than assumed.
 
 The standard error of the ratio comes from the delta method:
 
@@ -208,7 +246,7 @@ The standard error of the ratio comes from the delta method:
 
 It needs ≥ 6 stretches, and both kinds of usage must vary independently, which the determinant check enforces. Otherwise the split can't be identified and the check stays silent.
 
-Once the ratio is **clearly** different from 1, Opus usage is counted with it everywhere: the conversion, the profile and the forecast. "Clearly" means more than 2 standard errors away from 1, and measured to within 25%. *(`weightCheck`, `ratioOfTwo`, `opusWeight`, `reweightOpus`)*
+Once the ratio is **clearly** different from 1, that family's usage is counted with it everywhere: the conversion, the profile and the forecast. "Clearly" means more than 2 standard errors away from 1, and measured to within 25%. *(`weightCheck`, `ratioOfTwo`, `familyWeight`, `reweight`)*
 
 ### 4. Weekly profile (multiplicative weekday × hour model)
 
@@ -238,7 +276,7 @@ B = \max\!\Big(0,\; U_{\text{usual}} + \Delta\,\tau\,\big(1-e^{-H/\tau}\big)\Big
 \hat P = p + \hat k\,B
 ```
 
-The model forecast needs $\hat k$, at least 3 days of history and a known reset time. Until then the forecast is the baseline below. *(`forecast`)*
+$\hat k$ here is the learned conversion times the [scored correction](#10-scored-correction). The model forecast needs $\hat k$, at least 3 days of history and a known reset time. Until then the forecast is the baseline below. *(`forecast`)*
 
 ### 6. Baseline: "the current speed holds"
 
@@ -317,15 +355,25 @@ Replayed moments a few hours apart share most of their future, so they are not i
 
 The pane's "fit" rows show what was learned, for example "range ×2.5 so it held 80% instead of 59%". *(`tune`, `expectedBase`, `scenarios`)*
 
+### 10. Scored correction
+
+The replay above works in usage units, so it cannot see an error in $\hat k$ itself. Usage on claude.ai or another machine moves the windows more than your local usage explains, which makes $\hat k$ too high and every forecast run high; and the weekly replay takes 6–7 weeks before it tunes anything. The [scored forecasts](#how-it-scores-itself) can see it. Over the last 28 days, with each forecast's increase taken before any correction it already carried and both sides capped at the room the window had:
+
+```math
+c = \frac{\sum_i (y_i - p_i)}{\sum_i (\hat P_i - p_i)}
+```
+
+Once 5 forecasts over 3 windows are scored, $\hat k$ is multiplied by $c$, clipped to $[0.5, 1.5]$ and ignored within 5% of 1. Every logged forecast records the $c$ it was made with, so the next estimate measures the model and not its own correction. The pane's quality row shows it as "forecasts now scaled ×0.80". *(`correction`, `evaluate`)*
+
 ### Verdicts
 
 | Verdict | When |
 | --- | --- |
-| **HOLD ON** | ≥ 95% used, or the current speed reaches 100% before the reset *and* within 45 min (5-hour) / 1 day (week). |
-| **SLOW DOWN** | risk > 50% (or, before risk exists, point forecast > 100%), or ≥ 85% used. |
+| **HOLD ON** | ≥ 95% used, or the current speed reaches 100% before the reset *and* within 45 min (5-hour) / 6 h (week). |
+| **SLOW DOWN** | risk above 55%, and then until the risk is under 45% again (or, before risk exists, point forecast > 100%), or ≥ 85% used. |
 | **OK** | Otherwise. |
 
-Only hard data (the limit itself, or the measured speed) can say HOLD ON. A forecast from your usual pattern can only say SLOW DOWN.
+Only hard data (the limit itself, or the measured speed) can say HOLD ON. A forecast from your usual pattern can only say SLOW DOWN. The 45–55% band keeps the verdict from flapping around one number, and each window's last verdict is shared by all sessions, so a new session starts from the same one.
 
 ### Suggestions
 
@@ -334,19 +382,19 @@ Shown when a window is tight: not OK, or a forecast ≥ 100%, or a risk ≥ 50%.
 | Tip | Trigger |
 | --- | --- |
 | `/compact` or `/clear` | main context > 120k tokens (every message re-sends it) |
-| Switch to Sonnet | Opus > 60% of the last 5 h of usage (Sonnet makes the same limit last ≈ 5/3 ≈ 1.7× longer) |
+| Switch model | Fable or Opus > 60% of the last 5 h of usage. The tip names the cheaper models and how much longer the limit lasts at list prices: from Fable, Opus 5.5 about 2.5× and Sonnet 5.5 about 5×; from Opus 5.5, Sonnet 5.5 about 2×. When a model's own weekly window is the tight one, the tip says so instead: other models don't count against it |
 | Fewer subagents | subagents > 40% of the last 5 h |
 | Take a break | only the 5-hour window is in trouble: a break until its reset costs nothing from the week |
 | Daily budget | the weekly window is in trouble: $(100 - p) / \text{days left}$ per day |
 | Room for big tasks | nothing tight, > 10 points under an even pace this week, forecast < 90% and risk < 25% |
 
-The export records whether each tip was followed within the hour, for example a model switch or the context shrinking after `/compact`.
+The export records whether each tip was followed within the hour, for example a switch to a cheaper model or the context shrinking after `/compact`.
 
 ---
 
 ## How it scores itself
 
-Once an hour, each window's forecast is logged. One forecast per window per hour counts, even across sessions. After the window resets, each forecast is compared with the final percent $y$, over the last 28 days.
+Once an hour, each window's forecast is logged. One forecast per window per hour counts, even across sessions. After the window resets, each forecast is compared with the final percent $y$, the window's last reading, over the last 28 days.
 
 | Metric | Formula | Good means |
 | --- | --- | --- |
@@ -361,8 +409,10 @@ Notes:
 
 - Forecasts and outcomes are capped at 100% before scoring, since the reported percent can overshoot.
 - The ±0.5 tolerance on coverage allows for windows moving in whole points.
+- A forecast made after a window's last reading counts too: the window went idle, so that reading is its outcome. Leaving those out would hide exactly the forecasts that overshot.
+- The scored increases feed the [correction](#10-scored-correction).
 
-The pane shows these in plain words, and `forecasts.csv` has every scored forecast for your own analysis.
+The pane shows these in plain words, with how many windows they come from, and `forecasts.csv` has every scored forecast for your own analysis.
 
 ---
 
@@ -372,9 +422,11 @@ Everything stays in `~/.claude/limit-metrics/` (or `$CLAUDE_CONFIG_DIR/limit-met
 
 | File | Contents |
 | --- | --- |
-| `log-YYYY-MM-<session>.jsonl` | Readings, turns (tokens, context size, duration, interrupted or not), forecasts and events (warnings shown or hidden, tips, pane opened). One file per session and month. Written every 5 minutes and at session end. |
+| `log-YYYY-MM-<session>.jsonl` | Readings, turns (tokens, context size, duration, interrupted or not), forecasts (with the correction they carried) and events (warnings shown or hidden, tips, pane opened). One file per session and month. Written every 5 minutes and at session end. |
 | `rollup-YYYY-MM.json` | Each transcript's usage per day: tokens per model, tool calls, active quarter-hours, project, effort level, attribution (skill, plugin, MCP server, subagent type), turn and thinking time, interrupted answers, compactions and limit hits. Claude Code deletes transcripts after `cleanupPeriodDays` (30 by default); the rollups keep your history. |
-| `history-cache.json` | Usage per 15 minutes and limit hits per transcript, keyed by size and modification time. Kept for 10 weeks, also after Claude Code deletes the transcript, so the forecast can compare with up to 9 past weeks. |
+| `history-cache.json` | Usage per 15 minutes and limit hits per transcript, keyed by size and modification time. Kept for 10 weeks, also after Claude Code deletes the transcript, so the forecast can compare with up to 9 past weeks. A change of the token weights bumps its version and the transcripts are read again once. |
+
+The warning state every session shares (the current warning, the hidden one, each window's last verdict, the 80% and 90% marks already toasted) and the last answer about the model limits are in the mod's store, which Claude Code keeps under its configuration directory.
 
 ### Export (`/limits-forecast export` → `export/`)
 
@@ -404,6 +456,8 @@ Everything stays in `~/.claude/limit-metrics/` (or `$CLAUDE_CONFIG_DIR/limit-met
 - **Conversion:** Anthropic doesn't publish the usage → percent formula. The conversion is learned and approximate, and windows move in whole points, so the first stretches are coarse.
 - **Other usage:** limit hits and stretches assume the usage came from Claude Code on this machine. claude.ai or another computer in the same window makes the limit look smaller. Stretches with *no* local usage are dropped.
 - **History needed:** the interval and risk need a few past weeks (days for the 5-hour window).
+- **Model limits:** the usage endpoint is not a documented API. The mod reads the shape Claude Code 2.1.327 reads; if Anthropic changes it, the model's window disappears from the line and the pane and the rest works as before. Only Fable and Opus usage is tracked per model, so another model's own window is shown and forecast from its readings alone. Its first read comes mid-window, so the conversion is first learned from one long stretch (0% when the window began, a week before its reset, to the percent read) with an assumed ±25% until three stretches are in; usage of that model elsewhere in that stretch makes the limit look smaller.
+- **Other windows:** a window kind beyond these (a gateway's spend limit aside) is shown and forecast like the 5-hour one, labelled by its kind, until the mod knows it better.
 - **File size:**
   - Transcripts over 4 MiB are streamed through `cat`/`type`. The pane shows how many couldn't be read.
   - A monthly rollup over 4 MiB stops updating.
@@ -423,10 +477,11 @@ claude plugin test plugins/limits-forecast
 plugins/limits-forecast/
 ├── hooks/
 │   ├── stats.ts       # mean, type-7 quantile, CV, OLS slope, ratio estimator, 2-variable WLS
-│   ├── model.ts       # units, buckets, transcript parser, calibration, profile, forecast, scoring, limits line text
+│   ├── model.ts       # prices, units, buckets, transcript parser, calibration, weight check, profile, forecast, verdict, scoring, correction, limits line
 │   ├── retro.ts       # logs, daily rollups, limit hits, CSV/JSON export
-│   └── register.tsx   # wiring: Claude Code events, limits line and warning above the prompt, pane, /limits-forecast command
-├── tests/             # model, retro, register and end-to-end flow tests
+│   ├── report.ts      # the pane's rows and the text report
+│   └── register.tsx   # wiring: Claude Code events, options, shared warning state, the model limits read, limits line and warning above the prompt, pane, /limits-forecast command
+├── tests/             # model, retro, report, register and end-to-end flow tests
 └── types/index.d.ts   # the mod's state contract
 ```
 

@@ -1,7 +1,7 @@
 // Retrospective data, pure: the log format, daily rollups of transcripts, and
 // the export for looking back (limit hits, tips followed, forecast quality).
 
-import { evaluate, isOpus, LABEL, mergeHits, normReset, units } from './model'
+import { evaluate, family, labelOf, mergeHits, normReset, price, units } from './model'
 import type { Compaction, ForecastLog, Hit, Quality, Reading, Transcript } from './model'
 
 const MINUTE = 60_000
@@ -10,7 +10,7 @@ const MINUTE = 60_000
 // One JSON object per line in log-YYYY-MM-<session>.jsonl:
 //   r  a window moved:  { w, p, r }
 //   t  a turn ended:    { m, i, cw, cr, o, s, x?, d, a? }  (x context, d duration ms, a aborted)
-//   f  a forecast:      { w, r, p, pt, lo?, hi?, risk?, n?, b? }
+//   f  a forecast:      { w, r, p, pt, lo?, hi?, risk?, n?, b?, c? }  (c the correction it was scaled by)
 //   e  an event:        { e: warn | hide | pane | tip | compact | export, ... }
 
 export type LoggedTurn = { t: number; s: string; m?: string; i: number; cw: number; cr: number; o: number; sub: boolean; x?: number; d?: number; a: boolean }
@@ -60,8 +60,8 @@ export function logName(name: string) {
 
 /**
  * One transcript's day. `m` per model: [turns, input, cache write, cache read,
- * output, subagent turns]; `effort` and `attr`: [turns, units]; `dur`: [turns,
- * ms]; `q`: active quarter-hours.
+ * output, subagent turns, 1-hour cache write]; `effort` and `attr`: [turns,
+ * units]; `dur`: [turns, ms]; `q`: active quarter-hours.
  */
 export type DayRow = {
   m: Record<string, number[]>
@@ -105,13 +105,14 @@ export function rollupTranscript(tr: Transcript): Record<string, DayRow> {
   }
   for (const t of tr.turns) {
     const row = day(t.t)
-    const m = (row.m[t.model] ??= [0, 0, 0, 0, 0, 0])
+    const m = (row.m[t.model] ??= [0, 0, 0, 0, 0, 0, 0])
     m[0]! += 1
     m[1]! += t.in
     m[2]! += t.cw
     m[3]! += t.cr
     m[4]! += t.out
     m[5]! += t.sub ? 1 : 0
+    m[6] = (m[6] ?? 0) + (t.cw1h ?? 0)
     for (const name of t.tools ?? []) row.tools[name] = (row.tools[name] ?? 0) + 1
     const d = new Date(t.t)
     const q = d.getHours() * 4 + Math.floor(d.getMinutes() / 15)
@@ -167,8 +168,11 @@ export function tipFollowed(tip: LoggedEvent, turns: LoggedTurn[], events: Logge
       const last = [...before].reverse().find(t => !t.sub && t.x !== undefined)?.x
       return last !== undefined && after.some(t => !t.sub && t.x !== undefined && t.x < last / 2)
     }
-    case 'model':
-      return after.some(t => !t.sub && t.m !== undefined && !isOpus(t.m))
+    case 'model': {
+      // A later turn on a cheaper model than the one in use when the tip was shown.
+      const last = [...before].reverse().find(t => !t.sub && t.m)?.m
+      return after.some(t => !t.sub && t.m !== undefined && (last ? price(t.m).input < price(last).input : family(t.m) === 'other'))
+    }
     case 'subagents': {
       const share = (ts: LoggedTurn[]) => {
         const all = ts.reduce((a, t) => a + turnUnits(t), 0)
@@ -229,8 +233,8 @@ export function buildExport(x: ExportInput): Record<string, string> {
   const tok = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 }
   for (const f of Object.values(files)) {
     for (const [day, row] of Object.entries(f.days)) {
-      for (const [model, [n = 0, i = 0, cw = 0, cr = 0, o = 0, sub = 0]] of Object.entries(row.m)) {
-        const usd = units({ model, in: i, cw, cr, out: o })
+      for (const [model, [n = 0, i = 0, cw = 0, cr = 0, o = 0, sub = 0, cw1h = 0]] of Object.entries(row.m)) {
+        const usd = units({ model, in: i, cw, cr, out: o, cw1h })
         usage.push([day, f.project, model, n, i, cw, cr, o, sub, usd])
         turnsTotal += n
         usdTotal += usd
@@ -280,7 +284,7 @@ export function buildExport(x: ExportInput): Record<string, string> {
   const final = new Map<string, number>()
   for (const r of readings) final.set(`${r.kind}|${r.r}`, Math.max(final.get(`${r.kind}|${r.r}`) ?? 0, r.p))
   const quality: Record<string, Quality> = {}
-  for (const kind of ['five_hour', 'seven_day']) quality[kind] = evaluate(log.forecasts, readings, kind, x.now, 0)
+  for (const kind of new Set(['five_hour', 'seven_day', ...log.forecasts.map(f => f.kind)])) quality[kind] = evaluate(log.forecasts, readings, kind, x.now, 0)
 
   const tips: Record<string, { shown: number; followed: number; measurable: number }> = {}
   const tipRows: unknown[][] = []
@@ -345,11 +349,11 @@ export function buildExport(x: ExportInput): Record<string, string> {
     'effort-daily.csv': csv(['date', 'project', 'effort', 'turns', 'usd_equivalent'], efforts),
     'attribution-daily.csv': csv(['date', 'project', 'kind', 'name', 'turns', 'usd_equivalent'], attrs),
     'compactions.csv': csv(['time', 'project', 'trigger', 'tokens_before', 'tokens_after'], compactRows),
-    'limits.csv': csv(['time', 'window', 'percent', 'resets_at'], readings.map(r => [iso(r.t), LABEL[r.kind] ?? r.kind, r.p, r.r])),
-    'limit-hits.csv': csv(['time', 'window', 'resets_at', 'blocked_hours', 'retries'], hits.map(h => [iso(h.t), LABEL[h.kind] ?? h.kind, h.r, blockedMs(h) / 3_600_000, Math.max(0, h.tries - 1)])),
+    'limits.csv': csv(['time', 'window', 'percent', 'resets_at'], readings.map(r => [iso(r.t), labelOf(r.kind), r.p, r.r])),
+    'limit-hits.csv': csv(['time', 'window', 'resets_at', 'blocked_hours', 'retries'], hits.map(h => [iso(h.t), labelOf(h.kind), h.r, blockedMs(h) / 3_600_000, Math.max(0, h.tries - 1)])),
     'forecasts.csv': csv(
-      ['time', 'window', 'percent', 'forecast', 'lo80', 'hi80', 'risk', 'samples', 'baseline', 'resets_at', 'final'],
-      [...log.forecasts].sort((a, b) => a.t - b.t).map(f => [iso(f.t), LABEL[f.kind] ?? f.kind, f.p, f.pt, f.lo, f.hi, f.risk, f.n, f.b, f.r, Date.parse(f.r) <= x.now ? final.get(`${f.kind}|${f.r}`) : undefined]),
+      ['time', 'window', 'percent', 'forecast', 'lo80', 'hi80', 'risk', 'samples', 'baseline', 'correction', 'resets_at', 'final'],
+      [...log.forecasts].sort((a, b) => a.t - b.t).map(f => [iso(f.t), labelOf(f.kind), f.p, f.pt, f.lo, f.hi, f.risk, f.n, f.b, f.c, f.r, Date.parse(f.r) <= x.now ? final.get(`${f.kind}|${f.r}`) : undefined]),
     ),
     'turns.csv': csv(
       ['time', 'session', 'model', 'input', 'cache_write', 'cache_read', 'output', 'subagent', 'context', 'duration_ms', 'aborted'],

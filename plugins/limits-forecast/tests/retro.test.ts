@@ -10,13 +10,13 @@ const only = (turns: Turn[], more: Partial<Transcript> = {}): Transcript => ({ t
 
 test('rolls a transcript up per day: tokens per model, tool calls, active quarter-hours', async () => {
   const turns: Turn[] = [
-    { t: T, model: 'opus', in: 1, cw: 2, cr: 3, out: 4, tools: ['Bash', 'Read'], effort: 'high', attr: ['skill:review'], thinkMs: 500 },
+    { t: T, model: 'opus', in: 1, cw: 2, cw1h: 1, cr: 3, out: 4, tools: ['Bash', 'Read'], effort: 'high', attr: ['skill:review'], thinkMs: 500 },
     { t: T + 5 * 60_000, model: 'opus', in: 1, cw: 0, cr: 0, out: 1, sub: true, tools: ['Bash'] },
     { t: T + HOUR, model: 'sonnet', in: 0, cw: 0, cr: 0, out: 10 },
   ]
   const hit = { t: T + 2 * HOUR, kind: 'five_hour', r: new Date(T + 3 * HOUR).toISOString(), tries: 3 }
   const row = rollupTranscript(only(turns, { hits: [hit], durations: [{ t: T, ms: 20_000 }], compactions: [{ t: T, trigger: 'auto', pre: 9, post: 1 }] }))['2026-10-07']!
-  expect(row.m.opus).toEqual([2, 2, 2, 3, 5, 1])
+  expect(row.m.opus).toEqual([2, 2, 2, 3, 5, 1, 1])
   expect(row.tools).toEqual({ Bash: 2, Read: 1 })
   expect(row.q).toEqual([41, 45])
   expect(row.effort?.high?.[0]).toBe(1)
@@ -37,12 +37,12 @@ test('log lines round-trip, and a limit hit counts the time blocked until reset'
   const text = [
     JSON.stringify({ t: T, k: 'r', w: 'five_hour', p: 99, r }),
     JSON.stringify({ t: T + HOUR, k: 'r', w: 'five_hour', p: 100, r }),
-    JSON.stringify(forecastEntry({ t: T, kind: 'five_hour', r, p: 99, pt: 104, risk: 0.8 })),
+    JSON.stringify(forecastEntry({ t: T, kind: 'five_hour', r, p: 99, pt: 104, risk: 0.8, c: 0.8 })),
     JSON.stringify({ t: T, k: 't', m: 'opus', i: 1, cw: 0, cr: 0, o: 2, s: 0, x: 5000, d: 1200, a: 1 }),
     JSON.stringify({ t: T, k: 'e', e: 'tip', id: 'model' }),
   ].join('\n')
   const log = parseLog(text, 'abc')
-  expect(log.forecasts[0]).toEqual({ t: T, kind: 'five_hour', r, p: 99, pt: 104, risk: 0.8 })
+  expect(log.forecasts[0]).toEqual({ t: T, kind: 'five_hour', r, p: 99, pt: 104, risk: 0.8, c: 0.8 })
   expect(log.turns[0]).toEqual({ t: T, s: 'abc', m: 'opus', i: 1, cw: 0, cr: 0, o: 2, sub: false, x: 5000, d: 1200, a: true })
   expect(log.events[0]).toEqual({ t: T, e: 'tip', id: 'model', s: 'abc' })
   const hits = limitHits(log.readings)
@@ -64,6 +64,9 @@ test('a tip counts as followed when the session acted on it', async () => {
   expect(tipFollowed(tip('context'), turns, [])).toBe(true)
   expect(tipFollowed(tip('break'), turns, [])).toBe(false)
   expect(tipFollowed(tip('budget'), turns, [])).toBe(undefined)
+  // A cheaper model than the one in use: Fable to Opus counts, Opus to Fable does not.
+  expect(tipFollowed(tip('model'), [turn(T - 60_000, 'claude-fable-5-1'), turn(T + 60_000, 'claude-opus-5-5')], [])).toBe(true)
+  expect(tipFollowed(tip('model'), [turn(T - 60_000, 'claude-opus-5-5'), turn(T + 60_000, 'claude-fable-5-1')], [])).toBe(false)
   // Another session's turns do not count.
   expect(tipFollowed({ ...tip('model'), s: 'b' }, turns, [])).toBe(false)
 })
@@ -83,15 +86,16 @@ test('the export has CSV tables and a summary', async () => {
     'active-daily.csv', 'attribution-daily.csv', 'compactions.csv', 'effort-daily.csv', 'events.csv', 'forecasts.csv', 'limit-hits.csv', 'limits.csv',
     'summary.json', 'tips.csv', 'tools-daily.csv', 'turns.csv', 'usage-daily.csv',
   ])
-  expect(files['attribution-daily.csv']).toContain('2026-10-07,app,mcp,asana,1,25.5')
+  // Opus 5.5: cache reads at 0.05× $4, output at $20 per MTok.
+  expect(files['attribution-daily.csv']).toContain('2026-10-07,app,mcp,asana,1,20.2')
   expect(files['limit-hits.csv']).toContain(',Weekly,')
-  expect(files['usage-daily.csv']).toContain('2026-10-07,app,claude-opus-5-5,1,0,0,1000000,1000000,0,25.5')
+  expect(files['usage-daily.csv']).toContain('2026-10-07,app,claude-opus-5-5,1,0,0,1000000,1000000,0,20.2')
   const summary = JSON.parse(files['summary.json']!)
-  expect(summary.usdEquivalent).toBe(25.5)
+  expect(summary.usdEquivalent).toBe(20.2)
   expect(summary.limitHits.five_hour).toEqual({ count: 1, blockedHours: 1, retries: 0 })
   expect(summary.limitHits.seven_day).toEqual({ count: 1, blockedHours: 2, retries: 1 })
   expect(summary.compactions).toMatchObject({ manual: 1, auto: 0, medianTokensBefore: 300_000 })
-  expect(summary.byEffort.high.usd).toBe(25.5)
+  expect(summary.byEffort.high.usd).toBe(20.2)
   expect(summary.warnings).toEqual({ shown: 1, hidden: 1, paneOpened: 0 })
   expect(csv(['a'], [['x,"y"']])).toBe('a\n"x,""y"""\n')
 })

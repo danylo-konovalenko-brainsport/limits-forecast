@@ -20,6 +20,10 @@ export type ForecastView = {
   baseline?: number
   pace?: number
   perDayLeft?: number
+  /** The scored-bias correction applied to k, when not 1. */
+  correction?: number
+  /** A model's own weekly window: percent of the shared weekly limit the model may take and has taken. */
+  share?: { used: number; allowance: number }
   verdict: Verdict
   headline: string
 }
@@ -35,6 +39,16 @@ export type CalibView = {
   seAssumed?: boolean
   /** Re-learned from recent stretches only, after a change from this time on. */
   changedAt?: number
+}
+
+/** A model family's observed cost against the limit, relative to its assumed weight (1 = as assumed). */
+export type WeightView = {
+  family: string
+  label: string
+  ratio?: number
+  se?: number
+  n?: number
+  applied?: boolean
 }
 
 /** Forecast settings learned by replaying past weeks. */
@@ -56,6 +70,8 @@ export type QualityView = {
   kind: string
   label: string
   n: number
+  /** Distinct windows among the scored forecasts. */
+  windows: number
   mae?: number
   bias?: number
   coverage?: number
@@ -64,6 +80,10 @@ export type QualityView = {
   brier?: number
   nRisk: number
   skill?: number
+  /** Σ actual ÷ Σ forecast increase of the scored forecasts. */
+  ratio?: number
+  /** What k is scaled by after the scored bias; 1 for none. */
+  correction: number
 }
 
 export type View = {
@@ -77,8 +97,8 @@ export type View = {
   tips: { id: string; text: string }[]
   learned: {
     calib: CalibView[]
-    /** Observed Opus cost relative to the assumed weight (1 = as assumed). */
-    opusCheck?: { ratio: number; se: number; n: number; applied: boolean }
+    /** The weight check of each model family in use (Opus, Fable). */
+    weights: WeightView[]
     /** Forecast settings learned by replaying past weeks, per window. */
     tuning: TuningView[]
     /** Week-to-week variation of usage (coefficient of variation). */
@@ -101,6 +121,6 @@ export type View = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'limits-forecast': { view: View | null; hiddenKey: string }
+    'limits-forecast': { view: View | null; hiddenKey: string; ctx: { tokens: number; window: number } | null }
   }
 }

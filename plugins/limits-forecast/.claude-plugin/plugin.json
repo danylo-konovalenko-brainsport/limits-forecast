@@ -1,7 +1,29 @@
 {
   "name": "limits-forecast",
-  "version": "0.1.0",
-  "description": "Forecasts whether you will hit your 5-hour or weekly usage limit before it resets, learns your usage pattern over time and suggests what to change.",
+  "version": "0.3.0",
+  "description": "Forecasts whether you will hit your 5-hour or weekly usage limit, or a model's own weekly limit (Fable's), before it resets, learns your usage pattern over time and suggests what to change.",
   "author": { "name": "Danylo Konovalenko" },
-  "types": "./types/index.d.ts"
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "line": {
+      "type": "string",
+      "title": "Limits line",
+      "description": "The limits line above the prompt: full, compact (no bars, time or context; forecast and risk under pressure only) or off",
+      "options": ["full", "compact", "off"],
+      "default": "full"
+    },
+    "toasts": {
+      "type": "boolean",
+      "title": "Toasts",
+      "description": "Toasts when a verdict gets worse and when a window passes 80% and 90%",
+      "default": true
+    },
+    "modelLimits": {
+      "type": "boolean",
+      "title": "Model limits",
+      "description": "Show a model's own weekly limit (Fable's). Claude Code reports it to /usage only, so the mod reads it from Anthropic's usage endpoint with your login, at most every 5 minutes. Off: no network calls at all",
+      "default": true
+    }
+  }
 }

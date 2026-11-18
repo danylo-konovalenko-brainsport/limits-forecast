@@ -31,6 +31,7 @@ const big = [
 
 test('a limit reading produces a forecast, a status line and a log', async ($, on) => {
   const files: Record<string, string> = { [`${CFG}/projects/p1/s.jsonl`]: transcript, [BIG]: big }
+  const store = new Map<string, unknown>()
   const statuses: (string | undefined)[] = []
   const v = (value: unknown) => ({ value }) as never
   const limits = [
@@ -74,6 +75,22 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
     files[norm(x.path)] = x.text
     return v(undefined)
   })
+  // The warning state every session shares.
+  on('store.get', async (_$, e) => v(store.get((e as { key: string }).key)))
+  on('store.set', async (_$, e) => {
+    const x = e as { key: string; value: unknown }
+    store.set(x.key, x.value)
+    return v(undefined)
+  })
+  // Fable's own weekly window comes from the usage endpoint, with the session's login.
+  const asked: unknown[] = []
+  on('session.authorize', async () => v({ handle: 'h1', kind: 'bearer' }))
+  on('http.fetch', async (_$, e) => {
+    asked.push(e)
+    const scope = { model: { id: null, display_name: 'Fable' }, surface: null }
+    const limit = { kind: 'weekly_scoped', percent: 49, resets_at: new Date(NOW + 2 * 86_400_000 + 123).toISOString(), scope }
+    return v({ status: 200, ok: true, headers: {}, text: JSON.stringify({ limits: [limit], weekly_scoped_shares: [{ limit_index: 0, used_percent_of_weekly: 25, allowance_percent_of_weekly: 50 }] }) })
+  })
   on('command.register', async () => v(undefined))
   on('ui.toast', async () => v(undefined))
   on('ui.render', async ($$, e) => {
@@ -95,6 +112,7 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
   // The backfill runs on a timer a second after start.
   await clock.advance(1000)
   const cache = files[`${CFG}/limit-metrics/history-cache.json`] ?? ''
+  expect(cache).toContain('"version":4')
   expect(cache).toContain('/cfg/projects/p1/s.jsonl')
   expect(cache).toContain('/cfg/projects/p2/big.jsonl')
   // The transcript's days are kept in the monthly rollup, which outlives it.
@@ -107,6 +125,10 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
   expect(await text(/^   · \d\d:\d\d$/)).toBeTruthy()
   expect(await text(/^92%$/)).toBe('92%')
   expect(await text(/^30%$/)).toBe('30%')
+  // Fable's own window stands beside them, asked for once, from Anthropic alone.
+  expect(await text(/^fable $/)).toBe('fable ')
+  expect(await text(/^49%$/)).toBe('49%')
+  expect(asked).toEqual([{ url: 'https://api.anthropic.com/api/oauth/usage', init: { auth: 'h1' } }])
   // Wide enough: each window has its small bar with the limit mark.
   expect(await text(/^│$/)).toBe('│')
   expect(await text(/^3h00$/)).toBe('3h00')
@@ -115,6 +137,8 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
   expect(await text(/^\d+%$/)).toBeTruthy()
   expect(await lineBand.find({ type: 'Text', text: /^\d+%$/, color: 'error' } as never)).toBeTruthy()
   expect(await text(/^HOLD ON$/)).toBe('HOLD ON')
+  // The context window's fill ends the line.
+  expect(await text(/ctx /)).toBe('   · ctx 150k/200k 75%')
 
   // A response that does not move a window still refreshes the time.
   await clock.advance(3 * 60_000)
@@ -123,6 +147,13 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
   const hm = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
   expect(await text(/^   · /)).toBe(`   · ${hm}`)
   await lineBand.unmount()
+
+  // Too narrow for the bars and the context: they go, the rest stays.
+  const narrow = await $.ui.mount({ plugin: 'limits-forecast', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 20, bodyColumns: 100 } } as never)
+  expect(await narrow.find({ type: 'Text', text: /^│$/ } as never)).toBeFalsy()
+  expect(await narrow.find({ type: 'Text', text: /ctx / } as never)).toBeFalsy()
+  expect((await narrow.find({ type: 'Text', text: /^HOLD ON$/ } as never))?.text).toBe('HOLD ON')
+  await narrow.unmount()
 
   // A turn is logged with its duration; the window moves on.
   await clock.advance(1000)
@@ -141,6 +172,8 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
   // The pane and the warning band draw on both surfaces; Hide dismisses the band.
   const hitsPane = await $.ui.mount({ plugin: 'limits-forecast', surface: 'terminal', component: 'Pane', requestId: 'limits', props: {} } as never)
   expect((await hitsPane.find({ type: 'Text', text: /× 5-hour/ } as never))?.text).toContain('1× 5-hour · 1.0 h blocked')
+  expect((await hitsPane.find({ type: 'Text', text: /Opus cost/ } as never))?.text).toBeTruthy()
+  expect((await hitsPane.find({ type: 'Text', text: /of the weekly limit/ } as never))?.text).toBe('Fable may take 50% of the weekly limit and has taken 25%')
   await hitsPane.unmount()
   for (const surface of ['terminal', 'desktop'] as const) {
     const pane = await $.ui.mount({ plugin: 'limits-forecast', surface, component: 'Pane', requestId: 'limits', props: {} } as never)
@@ -151,8 +184,9 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
   expect((await band.find({ type: 'Text', text: /Hold on/ } as never))?.text).toContain('Hold on: 5-hour limit almost used')
   await band.press({ key: 'hide' } as never)
   expect(await band.find({ type: 'Text', text: /Hold on/ } as never)).toBeFalsy()
-  // Hidden, the warning goes; the limits line stays.
+  // Hidden, the warning goes; the limits line stays. The hide is shared with every session.
   expect(await band.find({ type: 'Text', text: /^HOLD ON$/ } as never)).toBeTruthy()
+  expect(store.get('warning')).toMatchObject({ key: 'hold:five_hour', overall: 'hold', hidden: 'hold:five_hour', verdicts: { five_hour: 'hold' } })
   await band.unmount()
 
   // As text, for surfaces without panes: the same rows.
@@ -186,6 +220,20 @@ test('a limit reading produces a forecast, a status line and a log', async ($, o
   const log = files[`${CFG}/limit-metrics/log-2026-10-abcdef12.jsonl`] ?? ''
   expect(log).toContain('"k":"r"')
   expect(log).toContain('"w":"five_hour"')
+  expect(log).toContain('"w":"seven_day_fable","p":49')
   expect(log).toContain('"d":1000')
   expect(log).toContain('"e":"hide"')
+})
+
+test('the line can be turned off', { options: { line: 'off' } }, async ($, on) => {
+  mock.clock(on, { now: NOW })
+  let passed = 0
+  on('ui.render', async ($$, e) => {
+    passed++
+    const { Box } = $$.ui.resolve(e as never) as any
+    return (globalThis as any).h(Box, null) as never
+  })
+  const band = await $.ui.mount({ plugin: 'limits-forecast', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 20, bodyColumns: 200 } } as never)
+  expect(passed).toBe(1)
+  await band.unmount()
 })
